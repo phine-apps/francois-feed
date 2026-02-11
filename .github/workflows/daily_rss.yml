@@ -1,0 +1,27 @@
+name: Daily RSS Generator
+on:
+  schedule:
+    - cron: "45 22 * * *" # UTC (07:45 JST)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+      - name: Set up Python
+        run: uv python install 3.13
+      - name: Run script
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GIST_ID: ${{ secrets.GIST_ID }}
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          RSS_CONFIG_PROMPT: ${{ secrets.RSS_CONFIG_PROMPT }}
+        run: uv run main.py -g ${{ secrets.GIST_ID }}
