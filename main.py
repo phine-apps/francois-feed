@@ -96,19 +96,21 @@ def generate_rss_content(api_key: str, instruction: str) -> str:
         url_map = {}
         sources_context = []
         metadata = search_response.candidates[0].grounding_metadata
-        
+
         if metadata and metadata.grounding_chunks:
             for i, chunk in enumerate(metadata.grounding_chunks):
                 if chunk.web:
-                    source_id = f"REF_ID_{i+1}"
+                    source_id = f"REF_ID_{i + 1}"
                     url = chunk.web.uri
                     title = chunk.web.title or "No Title"
-                    
+
                     url_map[source_id] = url
                     sources_context.append(f"ID: {source_id}\nTitle: {title}")
 
         if not url_map:
-            logger.error("No search results found with valid URLs from grounding metadata.")
+            logger.error(
+                "No search results found with valid URLs from grounding metadata."
+            )
             sys.exit(1)
 
         logger.info(f"Found {len(url_map)} sources. Generating RSS with ID masking...")
@@ -122,7 +124,7 @@ def generate_rss_content(api_key: str, instruction: str) -> str:
             f"Available Sources (ID-masked):\n{context_str}\n\n"
             "Task: Generate a valid RSS 2.0 XML feed based on the requirements and context above.\n"
             "Rules:\n"
-            "1. You MUST use the exact ID (e.g., REF_ID_1) in BOTH the <link> and <guid isPermaLink=\"true\"> tags for each item.\n"
+            '1. You MUST use the exact ID (e.g., REF_ID_1) in BOTH the <link> and <guid isPermaLink="true"> tags for each item.\n'
             "2. DO NOT include real URLs. ONLY use the provided IDs.\n"
             "3. Add a category prefix in brackets to each <title> (e.g., '[Weather]', '[AI]', '[News]', '[Book]', '[Quote]').\n"
             "4. For <pubDate>, use the specific publication time if mentioned in the context. "
@@ -153,10 +155,10 @@ def generate_rss_content(api_key: str, instruction: str) -> str:
 
         # Step 3: Post-processing - Restore real URLs
         content = rss_response.text
-        
+
         # Cleanup: remove markdown code blocks if present
         content = re.sub(r"```xml\n?|```", "", content).strip()
-        
+
         # Restore URLs by replacing IDs
         # Sort IDs by length descending to prevent partial replacement (e.g., REF_ID_1 matching REF_ID_11)
         for source_id in sorted(url_map.keys(), key=len, reverse=True):
