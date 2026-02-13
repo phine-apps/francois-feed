@@ -120,9 +120,7 @@ def extract_previous_items(rss_content: str) -> list[dict[str, str]]:
             title = item.find("title")
             link = item.find("link")
             if title is not None and link is not None:
-                items.append(
-                    {"title": title.text or "", "link": link.text or ""}
-                )
+                items.append({"title": title.text or "", "link": link.text or ""})
         return items
     except ET.ParseError as e:
         logger.warning(f"Failed to parse previous RSS content: {e}")
@@ -195,7 +193,10 @@ def generate_rss_content(
         dedup_instr = ""
         if previous_items:
             prev_items_str = "\n".join(
-                [f"- Title: {item['title']}\n  Link: {item['link']}" for item in previous_items]
+                [
+                    f"- Title: {item['title']}\n  Link: {item['link']}"
+                    for item in previous_items
+                ]
             )
             dedup_instr = (
                 "\n### Semantic Deduplication Rules:\n"
@@ -292,9 +293,7 @@ def main():
     parser = argparse.ArgumentParser(description="Generate RSS feed using Gemini API.")
     parser.add_argument("-o", "--output", help="Output to a file")
     parser.add_argument("-g", "--gist", help="Update a GitHub Gist with the given ID")
-    parser.add_argument(
-        "--no-dedup", action="store_true", help="Disable deduplication"
-    )
+    parser.add_argument("--no-dedup", action="store_true", help="Disable deduplication")
     args = parser.parse_args()
 
     instruction: str | None = os.environ.get("RSS_CONFIG_PROMPT")
