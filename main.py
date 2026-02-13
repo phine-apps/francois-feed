@@ -9,6 +9,7 @@ import sys
 from datetime import datetime
 
 import re
+import xml.etree.ElementTree as ET
 import requests
 from dotenv import load_dotenv
 from google.genai import Client
@@ -60,17 +61,86 @@ def update_gist(gist_id: str, content: str) -> None:
         sys.exit(1)
 
 
-def generate_rss_content(api_key: str, instruction: str) -> str:
-    """Generates RSS content using the Gemini API with URL masking to prevent hallucinations.
+def get_previous_rss_content(gist_id: str | None, filepath: str | None) -> str | None:
+    """Retrieves the previous RSS content from a Gist or a local file.
+
+    Args:
+        gist_id (str | None): The ID of the Gist to fetch from.
+        filepath (str | None): The path to the local file to read from.
+
+    Returns:
+        str | None: The RSS content if successfully retrieved, None otherwise.
+    """
+    if gist_id:
+        token = os.environ.get("GH_TOKEN")
+        if not token:
+            logger.warning("GH_TOKEN not set, cannot fetch previous Gist content.")
+            return None
+
+        headers = {"Authorization": f"token {token}"}
+        try:
+            response = requests.get(
+                f"https://api.github.com/gists/{gist_id}", headers=headers
+            )
+            response.raise_for_status()
+            gist_data = response.json()
+            if "my_rss.xml" in gist_data.get("files", {}):
+                return gist_data["files"]["my_rss.xml"].get("content")
+        except requests.exceptions.RequestException as e:
+            logger.warning(f"Failed to fetch previous Gist content: {e}")
+            return None
+
+    if filepath and os.path.exists(filepath):
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                return f.read()
+        except IOError as e:
+            logger.warning(f"Failed to read previous file content {filepath}: {e}")
+            return None
+
+    return None
+
+
+def extract_previous_items(rss_content: str) -> list[dict[str, str]]:
+    """Extracts titles and URLs from the provided RSS content.
+
+    Args:
+        rss_content (str): The RSS XML content to parse.
+
+    Returns:
+        list[dict[str, str]]: A list of dictionaries, each containing 'title' and 'link'.
+    """
+    if not rss_content:
+        return []
+
+    try:
+        root = ET.fromstring(rss_content)
+        items = []
+        for item in root.findall(".//item"):
+            title = item.find("title")
+            link = item.find("link")
+            if title is not None and link is not None:
+                items.append({"title": title.text or "", "link": link.text or ""})
+        return items
+    except ET.ParseError as e:
+        logger.warning(f"Failed to parse previous RSS content: {e}")
+        return []
+
+
+def generate_rss_content(
+    api_key: str, instruction: str, previous_items: list[dict[str, str]] | None = None
+) -> str:
+    """Generates RSS content using the Gemini API with URL masking and semantic deduplication.
 
     The process follows three steps:
     1. Search Phase: Get search grounding results and extract real URLs.
-    2. Generation Phase: Ask Gemini to generate RSS using IDs instead of URLs.
+    2. Generation Phase: Ask Gemini to generate RSS using IDs and deduplicate relative to previous items.
     3. Post-processing: Replace IDs with the mapped real URLs in the output.
 
     Args:
         api_key (str): The Gemini API key.
         instruction (str): The instruction prompt for the model.
+        previous_items (list[dict[str, str]] | None): A list of previously reported items (title and link).
 
     Returns:
         str: The generated RSS XML content with real URLs restored.
@@ -118,10 +188,30 @@ def generate_rss_content(api_key: str, instruction: str) -> str:
         # Step 2: Generation Phase - Generate RSS using IDs
         context_str = "\n---\n".join(sources_context)
         search_summary = search_response.text
+
+        # Prepare previous items for prompt
+        dedup_instr = ""
+        if previous_items:
+            prev_items_str = "\n".join(
+                [
+                    f"- Title: {item['title']}\n  Link: {item['link']}"
+                    for item in previous_items
+                ]
+            )
+            dedup_instr = (
+                "\n### Semantic Deduplication Rules:\n"
+                "Avoid redundant reporting. Below is a list of items from the PREVIOUS feed update:\n"
+                f"{prev_items_str}\n\n"
+                "1. If a news story in the current context describes effectively the SAME event or update as an item in the list above, DO NOT include it in the new feed. "
+                "Apply semantic understanding: if the core news is the same, skip it even if the wording or source title is slightly different.\n"
+                "2. If a source URL matches an item in the list but contains NEW or MORE RECENT updates that were NOT covered previously, you MAY include it as a new entry.\n"
+            )
+
         generation_prompt = (
             f"User Requirement: {instruction}\n\n"
             f"Detailed Search Context:\n{search_summary}\n\n"
             f"Available Sources (ID-masked):\n{context_str}\n\n"
+            f"{dedup_instr}\n"
             "Task: Generate a valid RSS 2.0 XML feed based on the requirements and context above.\n"
             "Rules:\n"
             '1. You MUST use the exact ID (e.g., REF_ID_1) in BOTH the <link> and <guid isPermaLink="true"> tags for each item.\n'
@@ -133,7 +223,7 @@ def generate_rss_content(api_key: str, instruction: str) -> str:
             "NEVER generate entries like 'no news found' or 'No new announcements or updates were confirmed'.\n"
             "6. If a total number of items is requested (e.g., '30 items'), you MUST fulfill this by adding more items from the categories that DO have valid sources. "
             "Prioritize depth in active news topics over including empty/update-only entries for quiet topics.\n"
-            "7. Deduplication: If multiple sources describe the same news story, merge them into a single entry or choose the most relevant one. DO NOT include the same story multiple times, even in different categories.\n"
+            "7. Deduplication (Internal): If multiple search results describe the same news story within this current run, merge them or choose the best one.\n"
             "8. Return ONLY raw XML. No markdown, no explanations."
         )
 
@@ -203,6 +293,7 @@ def main():
     parser = argparse.ArgumentParser(description="Generate RSS feed using Gemini API.")
     parser.add_argument("-o", "--output", help="Output to a file")
     parser.add_argument("-g", "--gist", help="Update a GitHub Gist with the given ID")
+    parser.add_argument("--no-dedup", action="store_true", help="Disable deduplication")
     args = parser.parse_args()
 
     instruction: str | None = os.environ.get("RSS_CONFIG_PROMPT")
@@ -216,7 +307,18 @@ def main():
         logger.warning("RSS_CONFIG_PROMPT is not set. Using default instruction.")
         instruction = "Generate a generic RSS feed update."
 
-    rss_content = generate_rss_content(api_key, instruction)
+    previous_items = []
+    if not args.no_dedup:
+        logger.info("Attempting to fetch previous RSS content for deduplication...")
+        # Try gist first if provided, then focal file if provided
+        prev_content = get_previous_rss_content(args.gist, args.output)
+        if prev_content:
+            previous_items = extract_previous_items(prev_content)
+            logger.info(f"Found {len(previous_items)} previous items to exclude.")
+        else:
+            logger.info("No previous RSS content found for deduplication.")
+
+    rss_content = generate_rss_content(api_key, instruction, previous_items)
 
     if args.output:
         save_to_file(rss_content, args.output)
