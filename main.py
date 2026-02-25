@@ -298,6 +298,9 @@ def main():
 
     instruction: str | None = os.environ.get("RSS_CONFIG_PROMPT")
     api_key: str | None = os.environ.get("GEMINI_API_KEY")
+    timezone_env = os.environ.get("TZ", "UTC (not set)")
+
+    logger.info(f"Starting RSS generation at {datetime.now()} (TZ: {timezone_env})")
 
     if not api_key:
         logger.error("GEMINI_API_KEY environment variable is not set.")
