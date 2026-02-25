@@ -12,7 +12,6 @@ jobs:
     runs-on: ubuntu-latest
     env:
       TZ: Asia/Tokyo
-      # Default to '07' if vars.SCHEDULE_HOUR_JST is not set to avoid linter warnings
       SCHEDULE_HOUR_JST: ${{ vars.SCHEDULE_HOUR_JST || '07' }}
     steps:
       - uses: actions/checkout@v6

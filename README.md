@@ -35,7 +35,7 @@ Set the following environment variables:
 
 - `GEMINI_API_KEY`: Your Gemini API key.
 - `RSS_CONFIG_PROMPT`: Instructions for the AI on what content to generate.
-- `GH_TOKEN`: GitHub Personal Access Token with gist scope (required for -g).
+- `GH_TOKEN`: GitHub Personal Access Token with `gist` scope (required for `-g`).
 
 ### Configuration Example
 
