@@ -12,13 +12,15 @@ jobs:
     runs-on: ubuntu-latest
     env:
       TZ: Asia/Tokyo
+      # Default to '07' if vars.SCHEDULE_HOUR_JST is not set to avoid linter warnings
+      SCHEDULE_HOUR_JST: ${{ vars.SCHEDULE_HOUR_JST || '07' }}
     steps:
       - uses: actions/checkout@v6
       - name: Check Schedule
         if: github.event_name == 'schedule'
         run: |
           CURRENT_HOUR=$(date +%H)
-          TARGET_HOUR="${{ vars.SCHEDULE_HOUR_JST }}"
+          TARGET_HOUR="${{ env.SCHEDULE_HOUR_JST }}"
           if [ "$CURRENT_HOUR" != "$TARGET_HOUR" ]; then
             echo "Current hour ($CURRENT_HOUR) does not match target hour ($TARGET_HOUR). Skipping."
             exit 0

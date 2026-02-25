@@ -35,7 +35,21 @@ Set the following environment variables:
 
 - `GEMINI_API_KEY`: Your Gemini API key.
 - `RSS_CONFIG_PROMPT`: Instructions for the AI on what content to generate.
-- `GH_TOKEN`: GitHub Personal Access Token with `gist` scope (required for `-g`).
+- `GH_TOKEN`: GitHub Personal Access Token with gist scope (required for -g).
+
+### Configuration Example
+
+For the `RSS_CONFIG_PROMPT` environment variable, you can use a prompt like this:
+
+```text
+Generate an RSS feed covering:
+1. Global News: Top 3 international headlines (e.g., from Reuters or AP).
+2. Tech Trends: Latest updates in Web Development and open-source projects.
+3. Productivity: A practical tip for remote work or time management.
+4. Science & Environment: Brief news on space exploration or climate research.
+
+Format: Use professional tone. Summaries should be 200-300 characters long.
+```
 
 ## Usage
 
@@ -57,19 +71,29 @@ uv run main.py -g your_gist_id_here
 >
 > You can also set environment variables in a `.env` file for local development. `uv` will automatically load them if configured, or you can use `export $(cat .env | xargs)` before running.
 
-### Configuration Example
+### CLI Options
 
-For the `RSS_CONFIG_PROMPT` environment variable, you can use a prompt like this:
+- `-h, --help`: Show help message.
+- `-o, --output OUTPUT`: Path to save the generated RSS xml.
+- `-g, --gist GIST`: GitHub Gist ID to update.
+- `--no-dedup`: Disable deduplication against previous results.
 
-```text
-Generate an RSS feed covering:
-1. Global News: Top 3 international headlines (e.g., from Reuters or AP).
-2. Tech Trends: Latest updates in Web Development and open-source projects.
-3. Productivity: A practical tip for remote work or time management.
-4. Science & Environment: Brief news on space exploration or climate research.
+### GitHub Actions (Automation)
 
-Format: Use professional tone. Summaries should be 200-300 characters long.
-```
+The project includes a workflow in `.github/workflows/daily_rss.yml` that runs daily. To use it, configure the following:
+
+#### Secrets
+
+The following should be configured as **GitHub Secrets**:
+
+- `GEMINI_API_KEY`
+- `RSS_CONFIG_PROMPT`
+- `GH_TOKEN`
+- `GIST_ID` (Passed to the script via the `-g` flag in the workflow)
+
+#### Variables
+
+- `SCHEDULE_HOUR_JST`: The hour (0-23) in Japan Standard Time at which you want the feed to be generated.
 
 ## Adding to RSS Readers
 
@@ -86,27 +110,6 @@ The following RSS readers have been verified to work correctly with Gist's raw U
 
 > [!NOTE]
 > Some RSS readers may fail to read this URL directly. If you encounter issues, consider using one of the recommended apps above.
-
-### CLI Options
-
-- `-h, --help`: Show help message.
-- `-o, --output OUTPUT`: Path to save the generated RSS xml.
-- `-g, --gist GIST`: GitHub Gist ID to update.
-
-### GitHub Actions
-
-The project includes a workflow in `.github/workflows/daily_rss.yml` that runs daily. To use it, configure the following:
-
-#### Secrets
-
-- `GEMINI_API_KEY`
-- `RSS_CONFIG_PROMPT`
-- `GH_TOKEN`
-- `GIST_ID`
-
-#### Variables
-
-- `SCHEDULE_HOUR_JST`: The hour (0-23) in Japan Standard Time at which you want the feed to be generated.
 
 ## License
 
