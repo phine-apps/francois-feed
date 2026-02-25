@@ -1,7 +1,7 @@
 name: Daily RSS Generator
 on:
   schedule:
-    - cron: "45 22 * * *" # UTC (07:45 JST)
+    - cron: "30 * * * *" # Every hour at minute 30
   workflow_dispatch:
 
 permissions:
@@ -10,8 +10,19 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      TZ: Asia/Tokyo
     steps:
       - uses: actions/checkout@v6
+      - name: Check Schedule
+        if: github.event_name == 'schedule'
+        run: |
+          CURRENT_HOUR=$(date +%H)
+          TARGET_HOUR="${{ vars.SCHEDULE_HOUR_JST }}"
+          if [ "$CURRENT_HOUR" != "$TARGET_HOUR" ]; then
+            echo "Current hour ($CURRENT_HOUR) does not match target hour ($TARGET_HOUR). Skipping."
+            exit 0
+          fi
       - name: Install uv
         uses: astral-sh/setup-uv@v7
         with:

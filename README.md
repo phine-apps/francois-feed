@@ -93,14 +93,20 @@ The following RSS readers have been verified to work correctly with Gist's raw U
 - `-o, --output OUTPUT`: Path to save the generated RSS xml.
 - `-g, --gist GIST`: GitHub Gist ID to update.
 
-## GitHub Actions
+### GitHub Actions
 
-The project includes a workflow in `.github/workflows/daily_rss.yml` that runs daily. To use it, add the following Secrets to your repository:
+The project includes a workflow in `.github/workflows/daily_rss.yml` that runs daily. To use it, configure the following:
+
+#### Secrets
 
 - `GEMINI_API_KEY`
-- `GIST_ID`
-- `GH_TOKEN`
 - `RSS_CONFIG_PROMPT`
+- `GH_TOKEN`
+- `GIST_ID`
+
+#### Variables
+
+- `SCHEDULE_HOUR_JST`: The hour (0-23) in Japan Standard Time at which you want the feed to be generated.
 
 ## License
 
