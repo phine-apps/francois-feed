@@ -1,7 +1,7 @@
 name: Daily RSS Generator
 on:
   schedule:
-    - cron: "30 * * * *" # Every hour at minute 30
+    - cron: "15,35,55 * * * *" # Every 20 minutes, shifted to avoid peak times
   workflow_dispatch:
 
 permissions:
@@ -15,6 +15,7 @@ jobs:
     env:
       TZ: Asia/Tokyo
       SCHEDULE_HOUR_JST: ${{ vars.SCHEDULE_HOUR_JST || '07' }}
+      GH_TOKEN: ${{ secrets.GH_TOKEN }}
     steps:
       - name: Check Schedule
         id: check
@@ -24,12 +25,23 @@ jobs:
             exit 0
           fi
 
+          TODAY=$(date +%F)
+          GIST_UPDATED_AT=$(gh api gists/${{ secrets.GIST_ID }} --jq '.updated_at')
+          GIST_DATE=$(date -d "$GIST_UPDATED_AT" +%F)
           CURRENT_HOUR=$(date +%H)
           TARGET_HOUR="${{ env.SCHEDULE_HOUR_JST }}"
-          if [ "$CURRENT_HOUR" = "$TARGET_HOUR" ]; then
+
+          echo "Today (JST): $TODAY"
+          echo "Gist Last Updated (JST): $GIST_DATE"
+          echo "Current Hour (JST): $CURRENT_HOUR"
+          echo "Target Hour (JST): $TARGET_HOUR"
+
+          # If it's already target hour (or later) AND not yet updated today
+          if [ "$CURRENT_HOUR" -ge "$TARGET_HOUR" ] && [ "$GIST_DATE" != "$TODAY" ]; then
+            echo "Time to run and not yet updated today. Proceeding."
             echo "should_run=true" >> $GITHUB_OUTPUT
           else
-            echo "Current hour ($CURRENT_HOUR) does not match target hour ($TARGET_HOUR). Skipping matching."
+            echo "Skipping (Too early or already updated today)."
             echo "should_run=false" >> $GITHUB_OUTPUT
           fi
 
