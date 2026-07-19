@@ -1,3 +1,13 @@
+# Environment variables file containing real secrets — never commit this
 .env
+
+# .env.example is a safe template and should be tracked by git
+!.env.example
+
+# Python bytecode and cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
 .venv/
 .serena/

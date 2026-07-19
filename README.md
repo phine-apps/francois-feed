@@ -4,7 +4,7 @@ A lightweight RSS feed generator powered by Gemini API. It generates an RSS 2.0 
 
 ## Features
 
-- **AI-Powered**: Uses Gemini 2.5 Flash to generate relevant and structured RSS content.
+- **AI-Powered**: Uses Gemini 3.5 Flash to generate relevant and structured RSS content.
 - **Flexible Output**: Supports stdout, local file output, and GitHub Gist updates.
 - **Fast & Modern**: Built with Python and managed by `uv` for high performance and reproducible environments.
 - **CI/CD Ready**: Integrated with GitHub Actions for daily automated updates.
@@ -31,7 +31,16 @@ uv sync
 
 ### Environment Variables
 
-Set the following environment variables:
+A `.env.example` template is included in the repository. Copy it and fill in your values:
+
+```bash
+cp .env.example .env
+```
+
+> [!CAUTION]
+> Never commit your `.env` file. It is excluded by `.gitignore`, but always double-check before pushing.
+
+Set the following environment variables in your `.env`:
 
 - `GEMINI_API_KEY`: Your Gemini API key.
 - `RSS_CONFIG_PROMPT`: Instructions for the AI on what content to generate.
