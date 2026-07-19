@@ -13,6 +13,7 @@ import time
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+from typing import Any, Callable, TypeVar
 
 import requests
 from dotenv import load_dotenv
@@ -92,14 +93,17 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+T = TypeVar("T")
+
+
 def execute_with_retry(
-    func,
-    *args,
-    max_retries=5,
-    initial_backoff=2.0,
-    backoff_factor=2.0,
-    **kwargs,
-):
+    func: Callable[..., T],
+    *args: Any,
+    max_retries: int = 5,
+    initial_backoff: float = 2.0,
+    backoff_factor: float = 2.0,
+    **kwargs: Any,
+) -> T:
     """Executes a function (usually a Gemini API call) with exponential backoff on 429/RESOURCE_EXHAUSTED errors.
 
     Args:
@@ -140,6 +144,8 @@ def execute_with_retry(
                 time.sleep(sleep_time)
             else:
                 raise e
+
+    raise RuntimeError("Unreachable")
 
 
 def update_gist(gist_id: str, content: str) -> None:
