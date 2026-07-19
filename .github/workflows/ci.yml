@@ -1,4 +1,4 @@
-name: Lint
+name: CI
 
 on:
   push:
@@ -7,7 +7,7 @@ on:
     branches: [main]
 
 jobs:
-  ruff:
+  lint-and-test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -21,3 +21,7 @@ jobs:
         run: uv run ruff check .
       - name: Run Ruff Format Check
         run: uv run ruff format --check .
+      - name: Run Type Check
+        run: uv run pyright main.py
+      - name: Run Tests
+        run: uv run pytest tests/ -v
