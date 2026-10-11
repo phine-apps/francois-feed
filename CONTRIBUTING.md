@@ -19,9 +19,10 @@ Thank you for your interest in contributing to francois-feed!
 ### Pull Requests
 
 - Create a new branch for your changes.
-- Ensure your code follows the project's formatting rules (run `uv run ruff format`).
+- Ensure your code follows the project's formatting rules (run `uv run ruff format .`).
+- Ensure all linter checks, type checks, and tests pass (`uv run ruff check .`, `uv run pyright`, `uv run pytest tests/ -v`).
 - Write clear, concise commit messages.
-- Ensure the CI lint check passes.
+- Ensure all CI checks pass.
 
 ## Development Setup
 
@@ -44,9 +45,20 @@ Thank you for your interest in contributing to francois-feed!
    uv run main.py
    ```
 
-4. **Format code:**
+4. **Quality checks (Linting, Formatting, Types, Tests):**
+
    ```bash
+   # Format code
    uv run ruff format .
+
+   # Run linter
+   uv run ruff check .
+
+   # Run static type checker
+   uv run pyright
+
+   # Run unit tests
+   uv run pytest tests/ -v
    ```
 
 By contributing, you agree that your contributions will be licensed under the MIT License of the project.

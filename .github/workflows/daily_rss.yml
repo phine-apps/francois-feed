@@ -59,8 +59,12 @@ jobs:
         run: uv python install 3.13
       - name: Run script
         env:
+          TZ: Asia/Tokyo
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GIST_ID: ${{ secrets.GIST_ID }}
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
           RSS_CONFIG_PROMPT: ${{ secrets.RSS_CONFIG_PROMPT }}
+          ENABLE_MEDIA_THUMBNAILS: ${{ vars.ENABLE_MEDIA_THUMBNAILS || secrets.ENABLE_MEDIA_THUMBNAILS || 'false' }}
+          GEMINI_SEARCH_MODEL: ${{ vars.GEMINI_SEARCH_MODEL || secrets.GEMINI_SEARCH_MODEL || '' }}
+          GEMINI_GEN_MODEL: ${{ vars.GEMINI_GEN_MODEL || secrets.GEMINI_GEN_MODEL || '' }}
         run: uv run main.py -g ${{ secrets.GIST_ID }}

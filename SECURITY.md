@@ -6,7 +6,7 @@ The following versions of francois-feed are currently being supported with secur
 
 | Version | Supported          |
 | ------- | ------------------ |
-| v0.2.x  | :white_check_mark: |
+| v0.1.x  | :white_check_mark: |
 
 ## Reporting a Vulnerability
 
