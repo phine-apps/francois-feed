@@ -11,10 +11,17 @@ Covers pure/testable functions:
   - URL replacement logic (via _restore_urls helper extracted inline)
 """
 
+import re
+import xml.etree.ElementTree as ET
+import xml.sax.saxutils
+from typing import Any
+
 import pytest
 import requests
-
 from google.genai.errors import APIError
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
 from main import (
     RSSGenerationError,
     _search_one_query,
@@ -22,6 +29,7 @@ from main import (
     execute_with_retry,
     extract_previous_items,
     get_previous_rss_content,
+    is_safe_url,
     plan_search_queries,
 )
 
@@ -190,13 +198,12 @@ class TestCreateHttpSession:
         session = create_http_session()
         # The session should have an adapter for https://
         adapter = session.get_adapter("https://example.com")
-        assert isinstance(adapter, requests.adapters.HTTPAdapter)
+        assert isinstance(adapter, HTTPAdapter)
 
     def test_retry_is_configured_on_adapter(self):
-        from urllib3.util.retry import Retry
-
         session = create_http_session()
         adapter = session.get_adapter("https://example.com")
+        assert isinstance(adapter, HTTPAdapter)
         assert isinstance(adapter.max_retries, Retry)
         assert adapter.max_retries.total == 3
 
@@ -213,7 +220,15 @@ class TestUrlRestoration:
     def _restore(content: str, url_map: dict[str, str]) -> str:
         """Mirrors the restoration logic in generate_rss_content."""
         for source_id in sorted(url_map.keys(), key=len, reverse=True):
-            content = content.replace(source_id, url_map[source_id])
+            escaped_url = xml.sax.saxutils.escape(
+                url_map[source_id], entities={'"': "&quot;"}
+            )
+            content = content.replace(source_id, escaped_url)
+        content = re.sub(
+            r"&(?!amp;|lt;|gt;|quot;|apos;|#\d+;|#x[0-9a-fA-F]+;)",
+            "&amp;",
+            content,
+        )
         return content
 
     def test_single_id_replaced(self):
@@ -250,6 +265,25 @@ class TestUrlRestoration:
         url_map = {"REF_ID_1": "https://example.com"}
         result = self._restore(content, url_map)
         assert "REF_ID_99" in result
+
+    def test_url_with_ampersand_is_escaped_and_parses_valid_xml(self):
+        content = '<rss version="2.0"><channel><item><link>REF_ID_1</link></item></channel></rss>'
+        url_map = {"REF_ID_1": "https://example.com/search?q=test&page=2"}
+        result = self._restore(content, url_map)
+        assert "https://example.com/search?q=test&amp;page=2" in result
+        root = ET.fromstring(result)
+        link = root.find(".//item/link")
+        assert link is not None
+        assert link.text == "https://example.com/search?q=test&page=2"
+
+    def test_stray_ampersand_in_title_is_sanitized(self):
+        content = '<rss version="2.0"><channel><item><title>Tom & Jerry</title><link>REF_ID_1</link></item></channel></rss>'
+        url_map = {"REF_ID_1": "https://example.com"}
+        result = self._restore(content, url_map)
+        root = ET.fromstring(result)
+        title = root.find(".//item/title")
+        assert title is not None
+        assert title.text == "Tom & Jerry"
 
 
 # ---------------------------------------------------------------------------
@@ -366,7 +400,25 @@ class TestPlanSearchQueries:
         class MockClient:
             models = MockModels()
 
-        client = MockClient()
+        client: Any = MockClient()
+        queries = plan_search_queries(client, "test instruction", "gemini-model")
+        assert queries == ["query1", "query2"]
+
+    def test_plan_search_queries_handles_conversational_preamble(self):
+        class MockResponse:
+            def __init__(self, text):
+                self.text = text
+
+        class MockModels:
+            def generate_content(self, model, contents, config=None):
+                return MockResponse(
+                    'Here are the queries:\n["query1", "query2"]\nHope this helps!'
+                )
+
+        class MockClient:
+            models = MockModels()
+
+        client: Any = MockClient()
         queries = plan_search_queries(client, "test instruction", "gemini-model")
         assert queries == ["query1", "query2"]
 
@@ -378,7 +430,7 @@ class TestPlanSearchQueries:
         class MockClient:
             models = MockModels()
 
-        client = MockClient()
+        client: Any = MockClient()
         queries = plan_search_queries(client, "test instruction", "gemini-model")
         assert queries == []
 
@@ -421,7 +473,7 @@ class TestSearchOneQuery:
         class MockClient:
             models = MockModels()
 
-        client = MockClient()
+        client: Any = MockClient()
         results, summary = _search_one_query(
             client, "test query", "model", "2026-07-19"
         )
@@ -469,3 +521,31 @@ class TestGetPreviousRssContent:
         monkeypatch.delenv("GH_TOKEN", raising=False)
         content = get_previous_rss_content(gist_id="12345", filepath=None)
         assert content is None
+
+
+# ---------------------------------------------------------------------------
+# is_safe_url()
+# ---------------------------------------------------------------------------
+
+
+class TestIsSafeUrl:
+    def test_public_http_and_https_are_safe(self):
+        assert is_safe_url("https://example.com/news") is True
+        assert is_safe_url("http://example.org/test") is True
+
+    def test_localhost_and_loopback_are_rejected(self):
+        assert is_safe_url("http://localhost:8080") is False
+        assert is_safe_url("http://127.0.0.1:8000") is False
+        assert is_safe_url("http://127.0.0.2") is False
+
+    def test_cloud_metadata_and_internal_domains_are_rejected(self):
+        assert is_safe_url("http://169.254.169.254/latest/meta-data") is False
+        assert is_safe_url("http://metadata.google.internal/computeMetadata") is False
+        assert is_safe_url("http://service.internal") is False
+        assert is_safe_url("http://host.local") is False
+
+    def test_non_http_schemes_are_rejected(self):
+        assert is_safe_url("ftp://example.com") is False
+        assert is_safe_url("file:///etc/passwd") is False
+        assert is_safe_url("javascript:alert(1)") is False
+        assert is_safe_url("") is False

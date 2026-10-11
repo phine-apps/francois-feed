@@ -22,6 +22,6 @@ jobs:
       - name: Run Ruff Format Check
         run: uv run ruff format --check .
       - name: Run Type Check
-        run: uv run pyright main.py
+        run: uv run pyright
       - name: Run Tests
         run: uv run pytest tests/ -v

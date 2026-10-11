@@ -4,7 +4,7 @@ A lightweight RSS feed generator powered by Gemini API. It generates an RSS 2.0 
 
 ## Features
 
-- **AI-Powered**: Uses Gemini 3.5 Flash to generate relevant and structured RSS content.
+- **AI-Powered**: Uses Gemini 3.8 Flash (with Gemini 2.5 Flash for search grounding) to generate relevant and structured RSS content.
 - **Flexible Output**: Supports stdout, local file output, and GitHub Gist updates.
 - **Fast & Modern**: Built with Python and managed by `uv` for high performance and reproducible environments.
 - **CI/CD Ready**: Integrated with GitHub Actions for daily automated updates.
@@ -42,9 +42,18 @@ cp .env.example .env
 
 Set the following environment variables in your `.env`:
 
+#### Required
 - `GEMINI_API_KEY`: Your Gemini API key.
 - `RSS_CONFIG_PROMPT`: Instructions for the AI on what content to generate.
 - `GH_TOKEN`: GitHub Personal Access Token with `gist` scope (required for `-g`).
+
+#### Optional
+- `GIST_ID`: GitHub Gist ID to update (can also be passed via `-g`).
+- `GEMINI_SEARCH_MODEL`: Gemini model for query planning and web search (defaults to `gemini-2.5-flash`).
+- `GEMINI_GEN_MODEL`: Gemini model for RSS XML generation (defaults to `gemini-3.8-flash`).
+- `GEMINI_MODEL`: Legacy single-model override fallback for both search and generation.
+- `TZ`: Timezone used for date calculations and logging (defaults to OS system timezone, e.g., `Asia/Tokyo`).
+- `ENABLE_MEDIA_THUMBNAILS`: Set to `true` to fetch `og:image` from source URLs and embed `<media:thumbnail>` tags (defaults to `false`).
 
 ### Configuration Example
 
@@ -103,6 +112,12 @@ The following should be configured as **GitHub Secrets**:
 #### Variables
 
 - `SCHEDULE_HOUR_JST`: The hour (0-23) in Japan Standard Time at which you want the feed to be generated.
+
+#### Optional Variables / Secrets
+
+- `ENABLE_MEDIA_THUMBNAILS`: Set to `true` to enable thumbnail extraction in the daily workflow.
+- `GEMINI_SEARCH_MODEL`: Custom Gemini model for search grounding (e.g., `gemini-2.5-flash`).
+- `GEMINI_GEN_MODEL`: Custom Gemini model for RSS generation (e.g., `gemini-3.8-flash` or `gemini-3.1-pro`).
 
 ## Adding to RSS Readers
 

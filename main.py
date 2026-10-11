@@ -3,6 +3,7 @@
 # http://opensource.org/licenses/mit-license.php
 
 import argparse
+import ipaddress
 import json
 import logging
 import os
@@ -11,9 +12,11 @@ import re
 import sys
 import time
 import xml.etree.ElementTree as ET
+import xml.sax.saxutils
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Any, Callable, TypeVar
+from urllib.parse import urlparse
 
 import requests
 from dotenv import load_dotenv
@@ -41,7 +44,7 @@ _REQUEST_TIMEOUT = 30
 # GEMINI_GEN_MODEL:    used for RSS XML generation (Step 2).
 # GEMINI_MODEL:        legacy single-model override; used as fallback for both above.
 _DEFAULT_SEARCH_MODEL = "gemini-2.5-flash"
-_DEFAULT_GEN_MODEL = "gemini-3.5-flash"
+_DEFAULT_GEN_MODEL = "gemini-3.8-flash"
 
 # RSS media and atom namespace URIs
 _MEDIA_NS = "http://search.yahoo.com/mrss/"
@@ -83,6 +86,53 @@ def create_http_session() -> requests.Session:
 
 # Load environment variables from .env file
 load_dotenv()
+
+# Apply timezone from environment if configured
+if hasattr(time, "tzset") and "TZ" in os.environ:
+    time.tzset()
+
+
+def is_safe_url(url: str) -> bool:
+    """Validates that a URL is a safe public HTTP/HTTPS URL, mitigating SSRF risks.
+
+    Rejects non-HTTP(S) schemes, localhost, private/loopback/link-local IP addresses,
+    and internal domain names.
+
+    Args:
+        url (str): The URL to check.
+
+    Returns:
+        bool: True if safe, False otherwise.
+    """
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme.lower() not in ("http", "https"):
+            return False
+        host = parsed.hostname
+        if not host:
+            return False
+        host_lower = host.lower()
+        if host_lower in (
+            "localhost",
+            "metadata.google.internal",
+        ) or host_lower.endswith((".local", ".internal", ".localhost")):
+            return False
+        try:
+            ip = ipaddress.ip_address(host)
+            if (
+                ip.is_private
+                or ip.is_loopback
+                or ip.is_link_local
+                or ip.is_reserved
+                or ip.is_unspecified
+            ):
+                return False
+        except ValueError:
+            pass
+        return True
+    except Exception:
+        return False
+
 
 # Configure logging
 logging.basicConfig(
@@ -264,7 +314,7 @@ def plan_search_queries(
 
     Reads the RSS_CONFIG_PROMPT and generates a small set of focused Google
     search queries — one per content category. This allows the search phase
-    (Step 1) to run category-specific parallel searches rather than a single
+    (Step 1) to run category-specific sequential searches rather than a single
     broad query, and automatically adapts when the prompt changes.
 
     Args:
@@ -296,6 +346,11 @@ def plan_search_queries(
         text = (response.text or "").strip()
         # Strip accidental markdown fences
         text = re.sub(r"```(?:json)?\n?|```", "", text).strip()
+        # Resiliently extract JSON array if wrapped in explanatory text
+        start = text.find("[")
+        end = text.rfind("]")
+        if start != -1 and end != -1 and start < end:
+            text = text[start : end + 1]
         queries: list[str] = json.loads(text)
         if not isinstance(queries, list) or not all(
             isinstance(q, str) for q in queries
@@ -350,6 +405,9 @@ def _search_one_query(
 def extract_og_image(url: str, session: requests.Session) -> str | None:
     """Fetches a URL and extracts the og:image meta tag value.
 
+    Validates URL safety before fetching to mitigate SSRF and bounds response
+    reading to 512KB to prevent memory exhaustion.
+
     Args:
         url (str): The page URL to inspect.
         session (requests.Session): HTTP session with retry logic.
@@ -357,17 +415,37 @@ def extract_og_image(url: str, session: requests.Session) -> str | None:
     Returns:
         str | None: The OG image URL, or None if not found or on error.
     """
+    if not is_safe_url(url):
+        logger.debug(f"Skipping unsafe or private URL for og:image: {url}")
+        return None
+
     try:
         resp = session.get(
             url,
             timeout=8,
             headers={"User-Agent": "Mozilla/5.0 (compatible; FrancoisFeed/1.0)"},
             allow_redirects=True,
+            stream=True,
         )
         resp.raise_for_status()
-        match = _OG_IMAGE_RE.search(resp.text)
+
+        # Safely read up to 512KB of the head content to extract og:image
+        byte_chunks: list[bytes] = []
+        total_bytes = 0
+        max_bytes = 512 * 1024
+        for chunk in resp.iter_content(chunk_size=16384):
+            if chunk:
+                byte_chunks.append(chunk)
+                total_bytes += len(chunk)
+                if total_bytes >= max_bytes:
+                    break
+        text = b"".join(byte_chunks).decode(resp.encoding or "utf-8", errors="replace")
+
+        match = _OG_IMAGE_RE.search(text)
         if match:
-            return match.group(1) or match.group(2)
+            og_url = match.group(1) or match.group(2)
+            if og_url and is_safe_url(og_url):
+                return og_url
     except Exception:
         pass
     return None
@@ -396,8 +474,6 @@ def add_media_thumbnails(xml_content: str) -> str:
     if not items:
         return xml_content
 
-    session = create_http_session()
-
     # Gather (item_element, url) pairs
     item_url_pairs: list[tuple[ET.Element, str]] = []
     for item in items:
@@ -405,10 +481,14 @@ def add_media_thumbnails(xml_content: str) -> str:
         if link_el is not None and link_el.text:
             item_url_pairs.append((item, link_el.text))
 
-    # Fetch OG images in parallel
+    # Fetch OG images in parallel with thread-isolated HTTP sessions
     def _fetch(pair: tuple[ET.Element, str]) -> tuple[ET.Element, str | None]:
         element, url = pair
-        return element, extract_og_image(url, session)
+        thread_session = create_http_session()
+        try:
+            return element, extract_og_image(url, thread_session)
+        finally:
+            thread_session.close()
 
     with ThreadPoolExecutor(max_workers=5) as executor:
         futures = {executor.submit(_fetch, pair): pair for pair in item_url_pairs}
@@ -421,10 +501,11 @@ def add_media_thumbnails(xml_content: str) -> str:
     # Serialize and ensure the media namespace is declared on the root <rss> element
     serialized = ET.tostring(root, encoding="unicode")
     if "xmlns:media" not in serialized:
-        serialized = serialized.replace(
-            "<rss ",
-            f'<rss xmlns:media="{_MEDIA_NS}" ',
-            1,
+        serialized = re.sub(
+            r"<rss(\s+|>)",
+            rf'<rss xmlns:media="{_MEDIA_NS}"\1',
+            serialized,
+            count=1,
         )
     if not serialized.startswith("<?xml"):
         serialized = '<?xml version="1.0" encoding="UTF-8"?>\n' + serialized
@@ -446,9 +527,10 @@ def generate_rss_content(
         focused search queries (one per content category). This decouples
         the search strategy from the code — when the prompt changes, the
         search queries adapt automatically.
-    Step 1 — Parallel Search: All queries are executed concurrently using
-        Google Search grounding. Results are merged into a single deduplicated
-        URL map with global REF_ID assignments.
+    Step 1 — Sequential Search: Queries are executed sequentially with a
+        brief delay to mitigate API rate limits, using Google Search grounding.
+        Results are merged into a single deduplicated URL map with global
+        REF_ID assignments.
     Step 2 — Generation: The gen_model produces RSS 2.0 XML from the
         combined context, using ID placeholders instead of real URLs.
     Step 3 — Post-processing: IDs are restored to real URLs, citation
@@ -532,19 +614,23 @@ def generate_rss_content(
         # Resolve redirect URLs in parallel to obtain clean, direct links in the RSS feed
         logger.info("Resolving search grounding redirect URLs...")
         resolved_pairs: list[tuple[str, str]] = []
-        session = create_http_session()
 
         def _resolve(pair: tuple[str, str]) -> tuple[str, str]:
             url, title = pair
             if "grounding-api-redirect" in url:
+                thread_session = create_http_session()
                 try:
-                    r = session.head(url, allow_redirects=True, timeout=5)
+                    r = thread_session.head(url, allow_redirects=True, timeout=5)
                     if r.status_code < 400:
                         return r.url, title
-                    r = session.get(url, allow_redirects=True, timeout=5)
+                    r = thread_session.get(
+                        url, allow_redirects=True, timeout=5, stream=True
+                    )
                     return r.url, title
                 except Exception as e:
                     logger.debug(f"Failed to resolve redirect for {url}: {e}")
+                finally:
+                    thread_session.close()
             return url, title
 
         with ThreadPoolExecutor(max_workers=10) as executor:
@@ -639,12 +725,21 @@ def generate_rss_content(
         # Remove markdown code fences if present
         content = re.sub(r"```xml\n?|```", "", content).strip()
 
-        # Restore real URLs (sort by length descending to avoid partial matches)
+        # Restore real URLs with XML entity escaping (sort by length descending to avoid partial matches)
         for source_id in sorted(url_map.keys(), key=len, reverse=True):
-            content = content.replace(source_id, url_map[source_id])
+            raw_url = url_map[source_id]
+            escaped_url = xml.sax.saxutils.escape(raw_url, entities={'"': "&quot;"})
+            content = content.replace(source_id, escaped_url)
 
         # Remove citation markers like [cite: ...]
         content = re.sub(r" ?\[cite:.*?\]", "", content)
+
+        # Sanitize any stray unescaped ampersands in XML text/links to prevent ParseError
+        content = re.sub(
+            r"&(?!amp;|lt;|gt;|quot;|apos;|#\d+;|#x[0-9a-fA-F]+;)",
+            "&amp;",
+            content,
+        )
 
         # Optional: add <media:thumbnail> from og:image (CON-4)
         if enable_thumbnails:
@@ -699,21 +794,22 @@ def main() -> None:
 
     instruction: str | None = os.environ.get("RSS_CONFIG_PROMPT")
     api_key: str | None = os.environ.get("GEMINI_API_KEY")
-    timezone_env = os.environ.get("TZ", "UTC (not set)")
+    system_tz = datetime.now().astimezone().tzname() or "Unknown"
+    timezone_info = os.environ.get("TZ") or f"{system_tz} (system default)"
 
     # Model selection: specific env vars take priority; legacy GEMINI_MODEL is the fallback.
     legacy_model = os.environ.get("GEMINI_MODEL", "")
-    search_model: str = os.environ.get(
-        "GEMINI_SEARCH_MODEL", legacy_model or _DEFAULT_SEARCH_MODEL
+    search_model: str = (
+        os.environ.get("GEMINI_SEARCH_MODEL") or legacy_model or _DEFAULT_SEARCH_MODEL
     )
-    gen_model: str = os.environ.get(
-        "GEMINI_GEN_MODEL", legacy_model or _DEFAULT_GEN_MODEL
+    gen_model: str = (
+        os.environ.get("GEMINI_GEN_MODEL") or legacy_model or _DEFAULT_GEN_MODEL
     )
     enable_thumbnails = (
         os.environ.get("ENABLE_MEDIA_THUMBNAILS", "false").lower() == "true"
     )
 
-    logger.info(f"Starting RSS generation at {datetime.now()} (TZ: {timezone_env})")
+    logger.info(f"Starting RSS generation at {datetime.now()} (TZ: {timezone_info})")
     logger.info(f"Models — search: {search_model}, generation: {gen_model}")
 
     if not api_key:
