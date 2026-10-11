@@ -154,7 +154,7 @@ def execute_with_retry(
     backoff_factor: float = 2.0,
     **kwargs: Any,
 ) -> T:
-    """Executes a function (usually a Gemini API call) with exponential backoff on 429/RESOURCE_EXHAUSTED errors.
+    """Executes a function (usually a Gemini API call) with exponential backoff on transient errors (429, 503, 5xx, etc.).
 
     Args:
         func: The callable to run.
@@ -170,25 +170,41 @@ def execute_with_retry(
         try:
             return func(*args, **kwargs)
         except Exception as e:
-            is_429 = False
+            is_transient = False
             if isinstance(e, APIError):
-                if e.code == 429:
-                    is_429 = True
-            if not is_429:
-                err_msg = str(e).lower()
-                if (
-                    "429" in err_msg
-                    or "resource_exhausted" in err_msg
-                    or "quota" in err_msg
+                if e.code in (429, 500, 502, 503, 504):
+                    is_transient = True
+                elif getattr(e, "status", None) in (
+                    "RESOURCE_EXHAUSTED",
+                    "UNAVAILABLE",
+                    "INTERNAL",
+                    "DEADLINE_EXCEEDED",
                 ):
-                    is_429 = True
+                    is_transient = True
+            if not is_transient:
+                err_msg = str(e).lower()
+                transient_keywords = (
+                    "429",
+                    "503",
+                    "500",
+                    "502",
+                    "504",
+                    "resource_exhausted",
+                    "quota",
+                    "unavailable",
+                    "high demand",
+                    "internal server error",
+                    "temporarily unavailable",
+                )
+                if any(kw in err_msg for kw in transient_keywords):
+                    is_transient = True
 
-            if is_429 and attempt < max_retries - 1:
+            if is_transient and attempt < max_retries - 1:
                 sleep_time = (
                     initial_backoff * (backoff_factor**attempt)
                 ) + random.uniform(0, 1.0)
                 logger.warning(
-                    f"Gemini API rate limited (429/RESOURCE_EXHAUSTED). "
+                    f"Gemini API transient error encountered. "
                     f"Retrying in {sleep_time:.2f} seconds (attempt {attempt + 1}/{max_retries}). Error: {e}"
                 )
                 time.sleep(sleep_time)
