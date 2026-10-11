@@ -381,6 +381,58 @@ class TestExecuteWithRetry:
         assert call_count == 3
         assert len(sleeps) == 2
 
+    def test_retries_on_503_api_error_and_succeeds(self, monkeypatch):
+        sleeps = []
+        monkeypatch.setattr("time.sleep", sleeps.append)
+
+        call_count = 0
+
+        def dummy_func():
+            nonlocal call_count
+            call_count += 1
+            if call_count < 3:
+                err = APIError(
+                    503,
+                    {
+                        "error": {
+                            "code": 503,
+                            "message": "This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later.",
+                            "status": "UNAVAILABLE",
+                        }
+                    },
+                )
+                raise err
+            return "success"
+
+        res = execute_with_retry(
+            dummy_func, max_retries=3, initial_backoff=0.01, backoff_factor=1.0
+        )
+        assert res == "success"
+        assert call_count == 3
+        assert len(sleeps) == 2
+
+    def test_retries_on_string_matching_503_unavailable_and_succeeds(self, monkeypatch):
+        sleeps = []
+        monkeypatch.setattr("time.sleep", sleeps.append)
+
+        call_count = 0
+
+        def dummy_func():
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise ValueError(
+                    "503 UNAVAILABLE - model currently experiencing high demand"
+                )
+            return "success"
+
+        res = execute_with_retry(
+            dummy_func, max_retries=2, initial_backoff=0.01, backoff_factor=1.0
+        )
+        assert res == "success"
+        assert call_count == 2
+        assert len(sleeps) == 1
+
 
 # ---------------------------------------------------------------------------
 # plan_search_queries()
