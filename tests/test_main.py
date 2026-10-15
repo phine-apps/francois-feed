@@ -28,6 +28,7 @@ from main import (
     create_http_session,
     execute_with_retry,
     extract_previous_items,
+    generate_rss_content,
     get_previous_rss_content,
     is_safe_url,
     plan_search_queries,
@@ -601,3 +602,49 @@ class TestIsSafeUrl:
         assert is_safe_url("file:///etc/passwd") is False
         assert is_safe_url("javascript:alert(1)") is False
         assert is_safe_url("") is False
+
+
+# ---------------------------------------------------------------------------
+# generate_rss_content()
+# ---------------------------------------------------------------------------
+
+
+class TestGenerateRssContent:
+    def test_malformed_xml_logs_snippet_and_raises(self, monkeypatch, caplog):
+        malformed = (
+            '<rss version="2.0"><channel>\n'
+            "<title>Feed</title>\n"
+            "<item><title>Item 1</title><link>REF_ID_1</link><description>bad <tag></description></item>\n"
+            "</channel></rss>"
+        )
+
+        class MockResponse:
+            def __init__(self, text):
+                self.text = text
+
+        class MockModels:
+            def generate_content(self, model, contents, config=None):
+                return MockResponse(malformed)
+
+        class MockClient:
+            def __init__(self, api_key):
+                self.models = MockModels()
+
+        monkeypatch.setattr("main.Client", MockClient)
+        monkeypatch.setattr("main.plan_search_queries", lambda *args, **kwargs: ["q1"])
+        monkeypatch.setattr(
+            "main._search_one_query",
+            lambda *args, **kwargs: ([("https://example.com", "Title")], "Summary"),
+        )
+
+        import logging
+
+        with caplog.at_level(logging.ERROR):
+            with pytest.raises(RSSGenerationError, match="Generated XML is malformed"):
+                generate_rss_content(
+                    api_key="mock_key",
+                    instruction="mock prompt",
+                )
+
+        assert "Malformed XML snippet around line" in caplog.text
+        assert "bad <tag>" in caplog.text

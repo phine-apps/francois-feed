@@ -712,7 +712,8 @@ def generate_rss_content(
             "6. If a total number of items is requested (e.g., '30 items'), you MUST fulfill this by adding more items from the categories that DO have valid sources. "
             "Prioritize depth in active news topics over including empty/update-only entries for quiet topics.\n"
             "7. Deduplication (Internal): If multiple search results describe the same news story within this current run, merge them or choose the best one.\n"
-            "8. Return ONLY raw XML. No markdown, no explanations."
+            "8. Use plain text without HTML tags in all elements; escape '<' and '>' as '&lt;' and '&gt;'.\n"
+            "9. Return ONLY raw XML. No markdown, no explanations."
         )
 
         rss_response: GenerateContentResponse = execute_with_retry(
@@ -766,6 +767,17 @@ def generate_rss_content(
         try:
             ET.fromstring(content)
         except ET.ParseError as e:
+            lines = content.splitlines()
+            line_num = e.position[0] if getattr(e, "position", None) else None
+            if line_num and 1 <= line_num <= len(lines):
+                start = max(1, line_num - 2)
+                end = min(len(lines), line_num + 2)
+                snippet = "\n".join(
+                    f"  {idx:4d}: {lines[idx - 1]}" for idx in range(start, end + 1)
+                )
+                logger.error(
+                    f"Malformed XML snippet around line {line_num}:\n{snippet}"
+                )
             raise RSSGenerationError(f"Generated XML is malformed: {e}") from e
 
         return content
