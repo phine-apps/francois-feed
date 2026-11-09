@@ -381,6 +381,77 @@ def plan_search_queries(
         return []
 
 
+def annotate_text_with_supports(
+    text: str,
+    supports: list[Any] | None,
+    num_chunks: int,
+) -> str:
+    """Annotates text with [CHUNK_idx] markers using GroundingSupport metadata.
+
+    Inserts source chunk index tags at the end of referenced text segments,
+    allowing downstream generation to precisely map summary claims to source URLs.
+
+    Args:
+        text (str): The raw generated text.
+        supports (list[Any] | None): Grounding supports from Gemini API.
+        num_chunks (int): Total number of grounding chunks available.
+
+    Returns:
+        str: Text annotated with [CHUNK_X] markers, or original text if no supports.
+    """
+    if not text or not supports or num_chunks <= 0:
+        return text
+
+    valid_supports: list[tuple[int, list[int]]] = []
+    for s in supports:
+        segment = getattr(s, "segment", None)
+        chunk_indices = getattr(s, "grounding_chunk_indices", None)
+        if not segment or not chunk_indices:
+            continue
+
+        valid_indices = [
+            idx
+            for idx in chunk_indices
+            if isinstance(idx, int) and 0 <= idx < num_chunks
+        ]
+        if not valid_indices:
+            continue
+
+        seg_text = getattr(segment, "text", None)
+        start_idx = getattr(segment, "start_index", None)
+        end_idx = getattr(segment, "end_index", None)
+
+        actual_end: int | None = None
+        if (
+            isinstance(start_idx, int)
+            and isinstance(end_idx, int)
+            and 0 <= start_idx < end_idx <= len(text)
+        ):
+            if seg_text is None or text[start_idx:end_idx] == seg_text:
+                actual_end = end_idx
+
+        if actual_end is None and seg_text and seg_text in text:
+            pos = text.find(seg_text)
+            if pos != -1:
+                actual_end = pos + len(seg_text)
+
+        if actual_end is not None:
+            valid_supports.append((actual_end, valid_indices))
+
+    if not valid_supports:
+        return text
+
+    # Sort descending by offset so insertion does not alter earlier offsets
+    valid_supports.sort(key=lambda item: item[0], reverse=True)
+
+    annotated = text
+    for end_offset, indices in valid_supports:
+        tag = " " + " ".join(f"[CHUNK_{idx}]" for idx in indices)
+        annotated = annotated[:end_offset] + tag + annotated[end_offset:]
+
+    return annotated
+
+
 def _search_one_query(
     client: Client,
     query: str,
@@ -411,11 +482,16 @@ def _search_one_query(
     results: list[tuple[str, str]] = []
     candidates = response.candidates
     metadata = candidates[0].grounding_metadata if candidates else None
-    if metadata and metadata.grounding_chunks:
-        for chunk in metadata.grounding_chunks:
+    chunks = getattr(metadata, "grounding_chunks", None) if metadata else None
+    if chunks:
+        for chunk in chunks:
             if chunk.web and chunk.web.uri:
                 results.append((chunk.web.uri, chunk.web.title or "No Title"))
-    return results, response.text or ""
+
+    raw_summary = response.text or ""
+    supports = getattr(metadata, "grounding_supports", None) if metadata else None
+    summary = annotate_text_with_supports(raw_summary, supports, len(results))
+    return results, summary
 
 
 def extract_og_image(url: str, session: requests.Session) -> str | None:
@@ -588,8 +664,8 @@ def generate_rss_content(
         # --------------------------------------------------------------
         logger.info(f"Step 1: Running {len(queries)} search queries sequentially...")
 
+        query_data: list[dict[str, Any]] = []
         all_url_title_pairs: list[tuple[str, str]] = []
-        all_summaries: list[str] = []
 
         quota_exhausted = False
         for i, q in enumerate(queries):
@@ -599,9 +675,14 @@ def generate_rss_content(
                 url_title_pairs, summary = execute_with_retry(
                     _search_one_query, client, q, search_model, current_date
                 )
+                query_data.append(
+                    {
+                        "query": q,
+                        "pairs": url_title_pairs,
+                        "summary": summary,
+                    }
+                )
                 all_url_title_pairs.extend(url_title_pairs)
-                if summary:
-                    all_summaries.append(summary)
                 logger.info(f"  Query '{q[:60]}': {len(url_title_pairs)} sources")
             except Exception as e:
                 err_msg = str(e).lower()
@@ -654,13 +735,54 @@ def generate_rss_content(
 
         # Assign global REF_IDs to deduplicated sources
         url_map: dict[str, str] = {}
-        sources_context: list[str] = []
-        for i, (url, title) in enumerate(resolved_pairs, start=1):
+        raw_url_to_id: dict[str, str] = {}
+        master_sources_context: list[str] = []
+        for i, (orig_pair, resolved_pair) in enumerate(
+            zip(unique_pairs, resolved_pairs), start=1
+        ):
             source_id = f"REF_ID_{i}"
-            url_map[source_id] = url
-            sources_context.append(f"ID: {source_id}\nTitle: {title}")
+            resolved_url, resolved_title = resolved_pair
+            orig_url, _ = orig_pair
+            url_map[source_id] = resolved_url
+            raw_url_to_id[orig_url] = source_id
+            raw_url_to_id[resolved_url] = source_id
+            master_sources_context.append(f"ID: {source_id}\nTitle: {resolved_title}")
 
-        combined_summary = "\n\n---\n\n".join(all_summaries)
+        # Build topic-grouped context with mapped REF_IDs
+        category_sections: list[str] = []
+        for q_item in query_data:
+            q_str = q_item["query"]
+            q_pairs = q_item["pairs"]
+            q_summary = q_item["summary"]
+
+            # Map chunk tags [CHUNK_0] in q_summary to [REF_ID_X]
+            for chunk_idx, (p_url, _) in enumerate(q_pairs):
+                ref_id = raw_url_to_id.get(p_url)
+                if ref_id:
+                    q_summary = q_summary.replace(f"[CHUNK_{chunk_idx}]", f"[{ref_id}]")
+            # Clean up any leftover unmapped [CHUNK_\d+]
+            q_summary = re.sub(r"\[CHUNK_\d+\]", "", q_summary)
+
+            # Query-specific sources
+            q_sources_lines: list[str] = []
+            seen_q_ids: set[str] = set()
+            for p_url, p_title in q_pairs:
+                ref_id = raw_url_to_id.get(p_url)
+                if ref_id and ref_id not in seen_q_ids:
+                    seen_q_ids.add(ref_id)
+                    q_sources_lines.append(f"  - ID: {ref_id} | Title: {p_title}")
+
+            sources_text = "\n".join(q_sources_lines) if q_sources_lines else "  (None)"
+
+            section = (
+                f"### Search Topic: {q_str}\n"
+                f"Available Sources for this topic:\n{sources_text}\n\n"
+                f"Context & Findings:\n{q_summary}"
+            )
+            category_sections.append(section)
+
+        combined_context = "\n\n---\n\n".join(category_sections)
+        master_context_str = "\n---\n".join(master_sources_context)
         logger.info(
             f"Step 1 complete: {len(url_map)} unique sources across all queries."
         )
@@ -693,27 +815,26 @@ def generate_rss_content(
                 "information not covered before, you MAY include it as a new entry.\n"
             )
 
-        context_str = "\n---\n".join(sources_context)
-
         generation_prompt = (
             f"User Requirement: {instruction}\n\n"
-            f"Search Context:\n{combined_summary}\n\n"
-            f"Available Sources (ID-masked):\n{context_str}\n\n"
+            f"Search Context by Topic:\n{combined_context}\n\n"
+            f"All Available Sources (ID-masked Reference):\n{master_context_str}\n\n"
             f"{dedup_instr}\n"
-            "Task: Generate a valid RSS 2.0 XML feed based on the requirements and context above.\n"
+            "Task: Generate a valid RSS 2.0 XML feed based on the requirements and search context above.\n"
             "Rules:\n"
             '1. For any item based on the Search Context, you MUST use the exact ID (e.g., REF_ID_1) in BOTH the <link> and <guid isPermaLink="true"> tags. Do NOT use real URLs for these items.\n'
-            "2. For items generated from your own knowledge (such as daily English vocabulary, quotes, or general knowledge items not found in the Search Context), you MUST use real, appropriate public URLs (e.g., a standard dictionary URL for vocabulary items like https://dictionary.cambridge.org/dictionary/english/<word>, or a search URL like https://www.google.com/search?q=weather+in+<city> (replacing <city> with the lowercase English name of the target city, e.g., 'tokyo') for weather). NEVER reuse or map these to any of the REF_ID_X placeholders.\n"
-            "3. Add a category prefix in brackets to each <title> (e.g., '[Weather]', '[AI]', '[News]', '[Book]', '[Quote]').\n"
-            "4. For <pubDate>, use the specific publication time if mentioned in the context. "
+            "2. Precise Source Matching: Each news story in the Search Context is annotated with its corresponding Source ID (e.g., [REF_ID_X]) and grouped under its specific Search Topic. You MUST match each news item with its EXACT corresponding Source ID from that topic. NEVER cross-assign Source IDs between different topics or unrelated articles.\n"
+            "3. For items generated from your own knowledge (such as daily English vocabulary, quotes, or general knowledge items not found in the Search Context), you MUST use real, appropriate public URLs (e.g., a standard dictionary URL for vocabulary items like https://dictionary.cambridge.org/dictionary/english/<word>, or a search URL like https://www.google.com/search?q=weather+in+<city> (replacing <city> with the lowercase English name of the target city, e.g., 'tokyo') for weather). NEVER reuse or map these to any of the REF_ID_X placeholders.\n"
+            "4. Add a category prefix in brackets to each <title> (e.g., '[Weather]', '[AI]', '[News]', '[Book]', '[Quote]').\n"
+            "5. For <pubDate>, use the specific publication time if mentioned in the context. "
             "If not mentioned, assign a realistic, varied time within the last 24 hours so that items are not all identical.\n"
-            "5. If no relevant sources or NEW updates are available for a specific topic, SKIP it entirely. "
+            "6. If no relevant sources or NEW updates are available for a specific topic, SKIP it entirely. "
             "NEVER generate entries like 'no news found' or 'No new announcements or updates were confirmed'.\n"
-            "6. If a total number of items is requested (e.g., '30 items'), you MUST fulfill this by adding more items from the categories that DO have valid sources. "
+            "7. If a total number of items is requested (e.g., '30 items'), you MUST fulfill this by adding more items from the categories that DO have valid sources. "
             "Prioritize depth in active news topics over including empty/update-only entries for quiet topics.\n"
-            "7. Deduplication (Internal): If multiple search results describe the same news story within this current run, merge them or choose the best one.\n"
-            "8. Use plain text without HTML tags in all elements; escape '<' and '>' as '&lt;' and '&gt;'.\n"
-            "9. Return ONLY raw XML. No markdown, no explanations."
+            "8. Deduplication (Internal): If multiple search results describe the same news story within this current run, merge them or choose the best one.\n"
+            "9. Use plain text without HTML tags in all elements; escape '<' and '>' as '&lt;' and '&gt;'. Do NOT output citation brackets like [REF_ID_X] or [cite: ...] in <title> or <description>.\n"
+            "10. Return ONLY raw XML. No markdown, no explanations."
         )
 
         rss_response: GenerateContentResponse = execute_with_retry(
@@ -742,14 +863,22 @@ def generate_rss_content(
         # Remove markdown code fences if present
         content = re.sub(r"```xml\n?|```", "", content).strip()
 
+        # Normalize any bracketed IDs inside link/guid tags: <link>[REF_ID_1]</link> -> <link>REF_ID_1</link>
+        content = re.sub(
+            r"(<(?:link|guid)[^>]*>)\s*\[(REF_ID_\d+)\]\s*(</(?:link|guid)>)",
+            r"\1\2\3",
+            content,
+        )
+
+        # Strip bracketed citation tags from text content before URL substitution
+        content = re.sub(r" ?\[cite:.*?\]", "", content)
+        content = re.sub(r" ?\[REF_ID_\d+\]", "", content)
+
         # Restore real URLs with XML entity escaping (sort by length descending to avoid partial matches)
         for source_id in sorted(url_map.keys(), key=len, reverse=True):
             raw_url = url_map[source_id]
             escaped_url = xml.sax.saxutils.escape(raw_url, entities={'"': "&quot;"})
             content = content.replace(source_id, escaped_url)
-
-        # Remove citation markers like [cite: ...]
-        content = re.sub(r" ?\[cite:.*?\]", "", content)
 
         # Sanitize any stray unescaped ampersands in XML text/links to prevent ParseError
         content = re.sub(

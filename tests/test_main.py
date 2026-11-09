@@ -25,6 +25,7 @@ from urllib3.util.retry import Retry
 from main import (
     RSSGenerationError,
     _search_one_query,
+    annotate_text_with_supports,
     create_http_session,
     execute_with_retry,
     extract_previous_items,
@@ -493,6 +494,71 @@ class TestPlanSearchQueries:
 # ---------------------------------------------------------------------------
 
 
+class TestAnnotateTextWithSupports:
+    def test_empty_or_none_inputs_return_original_text(self):
+        assert annotate_text_with_supports("", None, 0) == ""
+        assert annotate_text_with_supports("hello", None, 1) == "hello"
+        assert annotate_text_with_supports("hello", [], 1) == "hello"
+        assert annotate_text_with_supports("hello", [Any], 0) == "hello"
+
+    def test_valid_supports_annotated_in_order(self):
+        class MockSeg:
+            def __init__(self, s, e, t):
+                self.start_index = s
+                self.end_index = e
+                self.text = t
+
+        class MockSup:
+            def __init__(self, seg, idxs):
+                self.segment = seg
+                self.grounding_chunk_indices = idxs
+
+        text = "Story A happened. Story B happened."
+        supports = [
+            MockSup(MockSeg(0, 17, "Story A happened."), [0]),
+            MockSup(MockSeg(18, 35, "Story B happened."), [1]),
+        ]
+        result = annotate_text_with_supports(text, supports, 2)
+        assert result == "Story A happened. [CHUNK_0] Story B happened. [CHUNK_1]"
+
+    def test_japanese_unicode_offsets(self):
+        class MockSeg:
+            def __init__(self, s, e, t):
+                self.start_index = s
+                self.end_index = e
+                self.text = t
+
+        class MockSup:
+            def __init__(self, seg, idxs):
+                self.segment = seg
+                self.grounding_chunk_indices = idxs
+
+        text = "OpenAIが発表。Googleが公開。"
+        supports = [
+            MockSup(MockSeg(0, 8, "OpenAIが発表。"), [0]),
+            MockSup(MockSeg(8, 18, "Googleが公開。"), [1]),
+        ]
+        result = annotate_text_with_supports(text, supports, 2)
+        assert result == "OpenAIが発表。 [CHUNK_0]Googleが公開。 [CHUNK_1]"
+
+    def test_out_of_range_chunk_indices_ignored(self):
+        class MockSeg:
+            def __init__(self, s, e, t):
+                self.start_index = s
+                self.end_index = e
+                self.text = t
+
+        class MockSup:
+            def __init__(self, seg, idxs):
+                self.segment = seg
+                self.grounding_chunk_indices = idxs
+
+        text = "Valid story."
+        supports = [MockSup(MockSeg(0, 12, "Valid story."), [5, -1])]
+        result = annotate_text_with_supports(text, supports, 2)
+        assert result == "Valid story."
+
+
 class TestSearchOneQuery:
     def test_search_one_query_success(self):
         class MockWeb:
@@ -532,6 +598,57 @@ class TestSearchOneQuery:
         )
         assert results == [("https://example.com/1", "Title 1")]
         assert summary == "Summary text"
+
+    def test_search_one_query_with_grounding_supports(self):
+        class MockWeb:
+            def __init__(self, uri, title):
+                self.uri = uri
+                self.title = title
+
+        class MockChunk:
+            def __init__(self, uri, title):
+                self.web = MockWeb(uri, title)
+
+        class MockSeg:
+            def __init__(self, s, e, t):
+                self.start_index = s
+                self.end_index = e
+                self.text = t
+
+        class MockSup:
+            def __init__(self, seg, idxs):
+                self.segment = seg
+                self.grounding_chunk_indices = idxs
+
+        class MockMetadata:
+            def __init__(self, chunks, supports):
+                self.grounding_chunks = chunks
+                self.grounding_supports = supports
+
+        class MockCandidate:
+            def __init__(self, chunks, supports):
+                self.grounding_metadata = MockMetadata(chunks, supports)
+
+        class MockResponse:
+            def __init__(self, text, chunks, supports):
+                self.text = text
+                self.candidates = [MockCandidate(chunks, supports)]
+
+        class MockModels:
+            def generate_content(self, model, contents, config=None):
+                chunks = [MockChunk("https://example.com/item", "Item Title")]
+                supports = [MockSup(MockSeg(0, 12, "Summary text"), [0])]
+                return MockResponse("Summary text", chunks, supports)
+
+        class MockClient:
+            models = MockModels()
+
+        client: Any = MockClient()
+        results, summary = _search_one_query(
+            client, "test query", "model", "2026-07-19"
+        )
+        assert results == [("https://example.com/item", "Item Title")]
+        assert summary == "Summary text [CHUNK_0]"
 
 
 # ---------------------------------------------------------------------------
@@ -648,3 +765,69 @@ class TestGenerateRssContent:
 
         assert "Malformed XML snippet around line" in caplog.text
         assert "bad <tag>" in caplog.text
+
+    def test_bracketed_ids_in_links_and_citations_in_descriptions_cleaned(
+        self, monkeypatch
+    ):
+        xml_template = (
+            '<rss version="2.0"><channel>\n'
+            "<title>Feed</title>\n"
+            "<item>\n"
+            "  <title>Item 1</title>\n"
+            "  <link>[REF_ID_1]</link>\n"
+            '  <guid isPermaLink="true">[REF_ID_1]</guid>\n'
+            "  <description>Story summary with [REF_ID_1] citation and [cite: 1].</description>\n"
+            "</item>\n"
+            "</channel></rss>"
+        )
+
+        class MockResponse:
+            def __init__(self, text):
+                self.text = text
+
+        captured_prompt = {}
+
+        class MockModels:
+            def generate_content(self, model, contents, config=None):
+                captured_prompt["contents"] = contents
+                return MockResponse(xml_template)
+
+        class MockClient:
+            def __init__(self, api_key):
+                self.models = MockModels()
+
+        monkeypatch.setattr("main.Client", MockClient)
+        monkeypatch.setattr(
+            "main.plan_search_queries", lambda *args, **kwargs: ["q_topic1"]
+        )
+        monkeypatch.setattr(
+            "main._search_one_query",
+            lambda *args, **kwargs: (
+                [("https://example.com/target", "Target Article")],
+                "Target summary text [CHUNK_0]",
+            ),
+        )
+
+        result = generate_rss_content(
+            api_key="mock_key",
+            instruction="mock prompt",
+        )
+
+        root = ET.fromstring(result)
+        item = root.find(".//item")
+        assert item is not None
+        link = item.findtext("link")
+        guid = item.findtext("guid")
+        desc = item.findtext("description")
+
+        assert link == "https://example.com/target"
+        assert guid == "https://example.com/target"
+        assert desc is not None
+        assert "[REF_ID_1]" not in desc
+        assert "[cite:" not in desc
+        assert "Story summary with citation and ." in desc or "citation" in desc
+
+        prompt_str = captured_prompt.get("contents", "")
+        assert "### Search Topic: q_topic1" in prompt_str
+        assert "ID: REF_ID_1 | Title: Target Article" in prompt_str
+        assert "Target summary text [REF_ID_1]" in prompt_str
