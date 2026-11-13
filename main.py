@@ -97,6 +97,7 @@ def create_http_session() -> requests.Session:
     )
     adapter = HTTPAdapter(max_retries=retry)
     session.mount("https://", adapter)
+    session.mount("http://", adapter)
     return session
 
 
@@ -266,6 +267,9 @@ def update_gist(gist_id: str, content: str) -> None:
         if hasattr(e, "response") and e.response is not None:
             logger.error(f"Response content: {e.response.text}")
         sys.exit(1)
+    finally:
+        if hasattr(session, "close"):
+            session.close()
 
 
 def get_previous_rss_content(gist_id: str | None, filepath: str | None) -> str | None:
@@ -299,6 +303,9 @@ def get_previous_rss_content(gist_id: str | None, filepath: str | None) -> str |
         except requests.exceptions.RequestException as e:
             logger.warning(f"Failed to fetch previous Gist content: {e}")
             return None
+        finally:
+            if hasattr(session, "close"):
+                session.close()
 
     if filepath and os.path.exists(filepath):
         try:
@@ -401,6 +408,7 @@ def annotate_text_with_supports(
     text: str,
     supports: list[Any] | None,
     num_chunks: int,
+    chunk_index_map: dict[int, int] | None = None,
 ) -> str:
     """Annotates text with [CHUNK_idx] markers using GroundingSupport metadata.
 
@@ -410,7 +418,9 @@ def annotate_text_with_supports(
     Args:
         text (str): The raw generated text.
         supports (list[Any] | None): Grounding supports from Gemini API.
-        num_chunks (int): Total number of grounding chunks available.
+        num_chunks (int): Total number of valid grounding chunks available.
+        chunk_index_map (dict[int, int] | None): Optional mapping from original
+            grounding_chunks index to filtered results index.
 
     Returns:
         str: Text annotated with [CHUNK_X] markers, or original text if no supports.
@@ -418,6 +428,8 @@ def annotate_text_with_supports(
     if not text or not supports or num_chunks <= 0:
         return text
 
+    text_bytes = text.encode("utf-8")
+    search_start_char = 0
     valid_supports: list[tuple[int, list[int]]] = []
     for s in supports:
         segment = getattr(s, "segment", None)
@@ -425,11 +437,18 @@ def annotate_text_with_supports(
         if not segment or not chunk_indices:
             continue
 
-        valid_indices = [
-            idx
-            for idx in chunk_indices
-            if isinstance(idx, int) and 0 <= idx < num_chunks
-        ]
+        if chunk_index_map is not None:
+            valid_indices = [
+                chunk_index_map[idx]
+                for idx in chunk_indices
+                if isinstance(idx, int) and idx in chunk_index_map
+            ]
+        else:
+            valid_indices = [
+                idx
+                for idx in chunk_indices
+                if isinstance(idx, int) and 0 <= idx < num_chunks
+            ]
         if not valid_indices:
             continue
 
@@ -438,20 +457,42 @@ def annotate_text_with_supports(
         end_idx = getattr(segment, "end_index", None)
 
         actual_end: int | None = None
+        # 1. Try UTF-8 byte offsets first (standard Gemini API GroundingSupport behavior)
         if (
             isinstance(start_idx, int)
             and isinstance(end_idx, int)
+            and 0 <= start_idx < end_idx <= len(text_bytes)
+        ):
+            try:
+                prefix_str = text_bytes[:start_idx].decode("utf-8")
+                sliced_str = text_bytes[start_idx:end_idx].decode("utf-8")
+                if seg_text is None or sliced_str == seg_text:
+                    actual_end = len(prefix_str) + len(sliced_str)
+            except UnicodeDecodeError:
+                pass
+
+        # 2. Try character offsets if caller provided code-point indices
+        if (
+            actual_end is None
+            and isinstance(start_idx, int)
+            and isinstance(end_idx, int)
             and 0 <= start_idx < end_idx <= len(text)
         ):
-            if seg_text is None or text[start_idx:end_idx] == seg_text:
+            if (seg_text is not None and text[start_idx:end_idx] == seg_text) or (
+                seg_text is None and text.isascii()
+            ):
                 actual_end = end_idx
 
+        # 3. Fallback to progressive substring search to handle repeated phrases in order
         if actual_end is None and seg_text and seg_text in text:
-            pos = text.find(seg_text)
+            pos = text.find(seg_text, search_start_char)
+            if pos == -1:
+                pos = text.find(seg_text)
             if pos != -1:
                 actual_end = pos + len(seg_text)
 
         if actual_end is not None:
+            search_start_char = max(search_start_char, actual_end)
             valid_supports.append((actual_end, valid_indices))
 
     if not valid_supports:
@@ -496,25 +537,45 @@ def _search_one_query(
         config={"tools": [{"google_search": {}}]},
     )
     results: list[tuple[str, str]] = []
+    chunk_index_map: dict[int, int] = {}
     candidates = response.candidates
     metadata = candidates[0].grounding_metadata if candidates else None
     chunks = getattr(metadata, "grounding_chunks", None) if metadata else None
     if chunks:
-        for chunk in chunks:
+        for orig_idx, chunk in enumerate(chunks):
             if chunk.web and chunk.web.uri:
+                chunk_index_map[orig_idx] = len(results)
                 results.append((chunk.web.uri, chunk.web.title or "No Title"))
 
     raw_summary = response.text or ""
     supports = getattr(metadata, "grounding_supports", None) if metadata else None
-    summary = annotate_text_with_supports(raw_summary, supports, len(results))
+    summary = annotate_text_with_supports(
+        raw_summary,
+        supports,
+        len(results),
+        chunk_index_map=chunk_index_map,
+    )
     return results, summary
+
+
+def _is_response_chain_safe(resp: Any) -> bool:
+    """Validates that the final response URL and any redirect hops are safe public URLs."""
+    final_url = getattr(resp, "url", None)
+    if isinstance(final_url, str) and final_url and not is_safe_url(final_url):
+        return False
+    for hop in getattr(resp, "history", None) or ():
+        hop_url = getattr(hop, "url", None)
+        if isinstance(hop_url, str) and hop_url and not is_safe_url(hop_url):
+            return False
+    return True
 
 
 def extract_og_image(url: str, session: requests.Session) -> str | None:
     """Fetches a URL and extracts the og:image meta tag value.
 
-    Validates URL safety before fetching to mitigate SSRF and bounds response
-    reading to 512KB to prevent memory exhaustion.
+    Validates URL safety before and after redirects to mitigate SSRF, bounds
+    response reading to 512KB to prevent memory exhaustion, and always closes
+    the streamed response.
 
     Args:
         url (str): The page URL to inspect.
@@ -527,6 +588,7 @@ def extract_og_image(url: str, session: requests.Session) -> str | None:
         logger.debug(f"Skipping unsafe or private URL for og:image: {url}")
         return None
 
+    resp: Any = None
     try:
         resp = session.get(
             url,
@@ -535,6 +597,11 @@ def extract_og_image(url: str, session: requests.Session) -> str | None:
             allow_redirects=True,
             stream=True,
         )
+        if not _is_response_chain_safe(resp):
+            logger.debug(
+                f"Skipping unsafe redirect target for og:image: {getattr(resp, 'url', url)}"
+            )
+            return None
         resp.raise_for_status()
 
         # Safely read up to 512KB of the head content to extract og:image
@@ -557,6 +624,9 @@ def extract_og_image(url: str, session: requests.Session) -> str | None:
                     return img_url
     except Exception:
         pass
+    finally:
+        if resp is not None and hasattr(resp, "close"):
+            resp.close()
     return None
 
 
@@ -915,17 +985,23 @@ def generate_rss_content(
             url, title = pair
             if "grounding-api-redirect" in url:
                 thread_session = create_http_session()
+                r: Any = None
                 try:
                     r = thread_session.head(url, allow_redirects=True, timeout=5)
-                    if r.status_code < 400:
+                    if r.status_code < 400 and _is_response_chain_safe(r):
                         return r.url, title
+                    if hasattr(r, "close"):
+                        r.close()
                     r = thread_session.get(
                         url, allow_redirects=True, timeout=5, stream=True
                     )
-                    return r.url, title
+                    if _is_response_chain_safe(r):
+                        return r.url, title
                 except Exception as e:
                     logger.debug(f"Failed to resolve redirect for {url}: {e}")
                 finally:
+                    if r is not None and hasattr(r, "close"):
+                        r.close()
                     thread_session.close()
             return url, title
 
@@ -1171,6 +1247,7 @@ def main() -> None:
 
     instruction: str | None = os.environ.get("RSS_CONFIG_PROMPT")
     api_key: str | None = os.environ.get("GEMINI_API_KEY")
+    gist_id: str | None = args.gist or os.environ.get("GIST_ID") or None
     system_tz = datetime.now().astimezone().tzname() or "Unknown"
     timezone_info = os.environ.get("TZ") or f"{system_tz} (system default)"
 
@@ -1212,7 +1289,7 @@ def main() -> None:
     previous_items: list[dict[str, str]] = []
     if not args.no_dedup or merge_enabled:
         logger.info("Attempting to fetch previous RSS content...")
-        prev_content = get_previous_rss_content(args.gist, args.output)
+        prev_content = get_previous_rss_content(gist_id, args.output)
         if prev_content and not args.no_dedup:
             previous_items = extract_previous_items(prev_content)
             logger.info(f"Found {len(previous_items)} previous items to exclude.")
@@ -1240,10 +1317,10 @@ def main() -> None:
     if args.output:
         save_to_file(rss_content, args.output)
 
-    if args.gist:
-        update_gist(args.gist, rss_content)
+    if gist_id:
+        update_gist(gist_id, rss_content)
 
-    if not args.output and not args.gist:
+    if not args.output and not gist_id:
         print(rss_content)
 
 

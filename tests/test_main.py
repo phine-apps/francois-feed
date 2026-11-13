@@ -36,6 +36,7 @@ from main import (
     get_previous_rss_content,
     inject_channel_metadata,
     is_safe_url,
+    main,
     merge_rss_items,
     plan_search_queries,
 )
@@ -210,6 +211,13 @@ class TestCreateHttpSession:
     def test_retry_is_configured_on_adapter(self):
         session = create_http_session()
         adapter = session.get_adapter("https://example.com")
+        assert isinstance(adapter, HTTPAdapter)
+        assert isinstance(adapter.max_retries, Retry)
+        assert adapter.max_retries.total == 3
+
+    def test_http_adapter_is_mounted_with_retry(self):
+        session = create_http_session()
+        adapter = session.get_adapter("http://example.com")
         assert isinstance(adapter, HTTPAdapter)
         assert isinstance(adapter.max_retries, Retry)
         assert adapter.max_retries.total == 3
@@ -546,6 +554,49 @@ class TestAnnotateTextWithSupports:
         result = annotate_text_with_supports(text, supports, 2)
         assert result == "OpenAIが発表。 [CHUNK_0]Googleが公開。 [CHUNK_1]"
 
+    def test_repeated_japanese_phrases_annotated_separately(self):
+        class MockSeg:
+            def __init__(self, s, e, t):
+                self.start_index = s
+                self.end_index = e
+                self.text = t
+
+        class MockSup:
+            def __init__(self, seg, idxs):
+                self.segment = seg
+                self.grounding_chunk_indices = idxs
+
+        text = "AIが進化。さらにAIが進化。"
+        # Even with approximate offsets, repeated segments should match sequentially
+        supports = [
+            MockSup(MockSeg(0, 1, "AIが進化。"), [0]),
+            MockSup(MockSeg(2, 3, "AIが進化。"), [1]),
+        ]
+        result = annotate_text_with_supports(text, supports, 2)
+        assert result == "AIが進化。 [CHUNK_0]さらにAIが進化。 [CHUNK_1]"
+
+    def test_japanese_utf8_byte_offsets_without_seg_text(self):
+        class MockSeg:
+            def __init__(self, s, e, t):
+                self.start_index = s
+                self.end_index = e
+                self.text = t
+
+        class MockSup:
+            def __init__(self, seg, idxs):
+                self.segment = seg
+                self.grounding_chunk_indices = idxs
+
+        # "あいうえお" is 5 characters (15 UTF-8 bytes); "あい" is 6 UTF-8 bytes
+        text = "あいうえお"
+        supports = [
+            MockSup(MockSeg(0, 6, None), [0]),
+            # Invalid mid-character byte offset (4) when seg_text is None should be ignored
+            MockSup(MockSeg(0, 4, None), [1]),
+        ]
+        result = annotate_text_with_supports(text, supports, 2)
+        assert result == "あい [CHUNK_0]うえお"
+
     def test_out_of_range_chunk_indices_ignored(self):
         class MockSeg:
             def __init__(self, s, e, t):
@@ -653,6 +704,61 @@ class TestSearchOneQuery:
             client, "test query", "model", "2026-07-19"
         )
         assert results == [("https://example.com/item", "Item Title")]
+        assert summary == "Summary text [CHUNK_0]"
+
+    def test_search_one_query_remaps_indices_when_empty_chunk_skipped(self):
+        class MockWeb:
+            def __init__(self, uri, title):
+                self.uri = uri
+                self.title = title
+
+        class MockChunk:
+            def __init__(self, uri, title):
+                self.web = MockWeb(uri, title) if uri is not None else None
+
+        class MockSeg:
+            def __init__(self, s, e, t):
+                self.start_index = s
+                self.end_index = e
+                self.text = t
+
+        class MockSup:
+            def __init__(self, seg, idxs):
+                self.segment = seg
+                self.grounding_chunk_indices = idxs
+
+        class MockMetadata:
+            def __init__(self, chunks, supports):
+                self.grounding_chunks = chunks
+                self.grounding_supports = supports
+
+        class MockCandidate:
+            def __init__(self, chunks, supports):
+                self.grounding_metadata = MockMetadata(chunks, supports)
+
+        class MockResponse:
+            def __init__(self, text, chunks, supports):
+                self.text = text
+                self.candidates = [MockCandidate(chunks, supports)]
+
+        class MockModels:
+            def generate_content(self, model, contents, config=None):
+                chunks = [
+                    MockChunk(None, "Empty Chunk"),
+                    MockChunk("https://example.com/valid", "Valid Title"),
+                ]
+                # Original chunk index 1 corresponds to filtered results index 0
+                supports = [MockSup(MockSeg(0, 12, "Summary text"), [0, 1])]
+                return MockResponse("Summary text", chunks, supports)
+
+        class MockClient:
+            models = MockModels()
+
+        client: Any = MockClient()
+        results, summary = _search_one_query(
+            client, "test query", "model", "2026-07-19"
+        )
+        assert results == [("https://example.com/valid", "Valid Title")]
         assert summary == "Summary text [CHUNK_0]"
 
 
@@ -954,8 +1060,12 @@ class TestMergeRssItems:
 
 class TestExtractOgImageFallback:
     def test_falls_back_to_twitter_image(self):
+        closed = []
+
         class MockResp:
             encoding = "utf-8"
+            url = "https://example.com/post"
+            history = []
 
             def raise_for_status(self):
                 return None
@@ -963,9 +1073,67 @@ class TestExtractOgImageFallback:
             def iter_content(self, chunk_size=16384):
                 yield b'<html><head><meta name="twitter:image" content="https://example.com/tw.jpg"></head></html>'
 
+            def close(self):
+                closed.append(True)
+
         class MockSession:
             def get(self, *args, **kwargs):
                 return MockResp()
 
         url = extract_og_image("https://example.com/post", MockSession())  # type: ignore[arg-type]
         assert url == "https://example.com/tw.jpg"
+        assert closed == [True]
+
+    def test_rejects_unsafe_redirect_target_and_closes_response(self):
+        closed = []
+
+        class MockResp:
+            encoding = "utf-8"
+            url = "http://127.0.0.1:8080/internal"
+            history = []
+
+            def raise_for_status(self):
+                return None
+
+            def iter_content(self, chunk_size=16384):
+                yield b'<html><head><meta property="og:image" content="https://example.com/og.jpg"></head></html>'
+
+            def close(self):
+                closed.append(True)
+
+        class MockSession:
+            def get(self, *args, **kwargs):
+                return MockResp()
+
+        url = extract_og_image("https://example.com/redirect-to-local", MockSession())  # type: ignore[arg-type]
+        assert url is None
+        assert closed == [True]
+
+
+class TestMainGistIdEnvFallback:
+    def test_uses_gist_id_from_env_when_cli_flag_omitted(self, monkeypatch):
+        monkeypatch.setenv("GEMINI_API_KEY", "mock_key")
+        monkeypatch.setenv("RSS_CONFIG_PROMPT", "mock prompt")
+        monkeypatch.setenv("GIST_ID", "env_gist_123")
+        monkeypatch.setattr("sys.argv", ["main.py"])
+
+        fetched_gist_ids: list[str | None] = []
+        updated_gists: list[tuple[str, str]] = []
+
+        def mock_get_prev(gist_id, filepath):
+            fetched_gist_ids.append(gist_id)
+            return None
+
+        def mock_update_gist(gist_id, content):
+            updated_gists.append((gist_id, content))
+
+        monkeypatch.setattr("main.get_previous_rss_content", mock_get_prev)
+        monkeypatch.setattr(
+            "main.generate_rss_content", lambda *args, **kwargs: RSS_WITH_ITEMS
+        )
+        monkeypatch.setattr("main.update_gist", mock_update_gist)
+
+        main()
+
+        assert fetched_gist_ids == ["env_gist_123"]
+        assert updated_gists == [("env_gist_123", RSS_WITH_ITEMS)]
