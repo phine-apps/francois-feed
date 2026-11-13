@@ -24,14 +24,19 @@ from urllib3.util.retry import Retry
 
 from main import (
     RSSGenerationError,
+    _sanitize_xml_ampersands,
     _search_one_query,
     annotate_text_with_supports,
     create_http_session,
+    ensure_xml_namespaces,
     execute_with_retry,
+    extract_og_image,
     extract_previous_items,
     generate_rss_content,
     get_previous_rss_content,
+    inject_channel_metadata,
     is_safe_url,
+    merge_rss_items,
     plan_search_queries,
 )
 
@@ -831,3 +836,136 @@ class TestGenerateRssContent:
         assert "### Search Topic: q_topic1" in prompt_str
         assert "ID: REF_ID_1 | Title: Target Article" in prompt_str
         assert "Target summary text [REF_ID_1]" in prompt_str
+
+
+# ---------------------------------------------------------------------------
+# Feeder compatibility extensions
+# ---------------------------------------------------------------------------
+
+
+class TestEnsureXmlNamespaces:
+    def test_adds_missing_namespaces_when_prefixes_used(self):
+        xml = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<rss version="2.0"><channel><item>'
+            "<content:encoded><![CDATA[<p>Hello</p>]]></content:encoded>"
+            "<dc:creator>Example</dc:creator>"
+            "</item></channel></rss>"
+        )
+        result = ensure_xml_namespaces(xml)
+        assert 'xmlns:content="http://purl.org/rss/1.0/modules/content/"' in result
+        assert 'xmlns:dc="http://purl.org/dc/elements/1.1/"' in result
+        root = ET.fromstring(result)
+        assert root.tag == "rss"
+
+    def test_does_not_duplicate_existing_namespace(self):
+        xml = (
+            '<rss xmlns:content="http://purl.org/rss/1.0/modules/content/" '
+            'version="2.0"><channel><item>'
+            "<content:encoded>Hi</content:encoded>"
+            "</item></channel></rss>"
+        )
+        result = ensure_xml_namespaces(xml)
+        assert result.count("xmlns:content=") == 1
+
+
+class TestSanitizeXmlAmpersands:
+    def test_escapes_outside_cdata_and_preserves_inside_cdata(self):
+        xml = (
+            "<item><title>A & B</title>"
+            "<content:encoded><![CDATA[<p>A & B <a href='https://x.com?a=1&b=2'>link</a></p>]]></content:encoded>"
+            "</item>"
+        )
+        result = _sanitize_xml_ampersands(xml)
+        assert "<title>A &amp; B</title>" in result
+        assert (
+            "<![CDATA[<p>A & B <a href='https://x.com?a=1&b=2'>link</a></p>]]>"
+            in result
+        )
+
+
+class TestInjectChannelMetadata:
+    def test_injects_image_and_atom_self_link(self):
+        result = inject_channel_metadata(
+            RSS_WITH_ITEMS,
+            feed_image_url="https://example.com/icon.png",
+            feed_self_url="https://example.com/feed.xml",
+        )
+        root = ET.fromstring(result)
+        channel = root.find("channel")
+        assert channel is not None
+        image = channel.find("image")
+        assert image is not None
+        assert image.findtext("url") == "https://example.com/icon.png"
+        assert image.findtext("title") == "Test Feed"
+        atom_links = channel.findall("{http://www.w3.org/2005/Atom}link")
+        assert len(atom_links) == 1
+        assert atom_links[0].get("rel") == "self"
+        assert atom_links[0].get("href") == "https://example.com/feed.xml"
+
+    def test_ignores_unsafe_urls(self):
+        result = inject_channel_metadata(
+            RSS_WITH_ITEMS,
+            feed_image_url="http://127.0.0.1/icon.png",
+            feed_self_url="file:///etc/passwd",
+        )
+        root = ET.fromstring(result)
+        assert root.find(".//image") is None
+        assert root.find(".//{http://www.w3.org/2005/Atom}link") is None
+
+
+class TestMergeRssItems:
+    def test_merges_non_duplicate_items_respecting_max_items(self):
+        new_xml = """\
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Test Feed</title>
+    <item>
+      <title>[AI] New story</title>
+      <link>https://example.com/new</link>
+      <guid isPermaLink="true">https://example.com/new</guid>
+    </item>
+    <item>
+      <title>[AI] Some AI news</title>
+      <link>https://example.com/ai-news</link>
+      <guid isPermaLink="true">https://example.com/ai-news</guid>
+    </item>
+  </channel>
+</rss>
+"""
+        merged = merge_rss_items(new_xml, RSS_WITH_ITEMS, max_items=3)
+        root = ET.fromstring(merged)
+        items = root.findall(".//item")
+        assert len(items) == 3
+        links = [it.findtext("link") for it in items]
+        assert links == [
+            "https://example.com/new",
+            "https://example.com/ai-news",
+            "https://example.com/python",
+        ]
+
+    def test_returns_new_xml_when_previous_malformed(self):
+        assert (
+            merge_rss_items(RSS_WITH_ITEMS, MALFORMED_XML, max_items=10)
+            == RSS_WITH_ITEMS
+        )
+
+
+class TestExtractOgImageFallback:
+    def test_falls_back_to_twitter_image(self):
+        class MockResp:
+            encoding = "utf-8"
+
+            def raise_for_status(self):
+                return None
+
+            def iter_content(self, chunk_size=16384):
+                yield b'<html><head><meta name="twitter:image" content="https://example.com/tw.jpg"></head></html>'
+
+        class MockSession:
+            def get(self, *args, **kwargs):
+                return MockResp()
+
+        url = extract_og_image("https://example.com/post", MockSession())  # type: ignore[arg-type]
+        assert url == "https://example.com/tw.jpg"
