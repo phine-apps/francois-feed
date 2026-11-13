@@ -53,7 +53,11 @@ Set the following environment variables in your `.env`:
 - `GEMINI_GEN_MODEL`: Gemini model for RSS XML generation (defaults to `gemini-3.8-flash`).
 - `GEMINI_MODEL`: Legacy single-model override fallback for both search and generation.
 - `TZ`: Timezone used for date calculations and logging (defaults to OS system timezone, e.g., `Asia/Tokyo`).
-- `ENABLE_MEDIA_THUMBNAILS`: Set to `true` to fetch `og:image` from source URLs and embed `<media:thumbnail>` tags (defaults to `false`).
+- `ENABLE_MEDIA_THUMBNAILS`: Set to `true` to fetch `og:image` (with `twitter:image` fallback) from source URLs and embed `<media:thumbnail>` tags (defaults to `false`).
+- `ENABLE_FEED_MERGE`: Set to `true` to merge newly generated items with previous feed items (defaults to `false`).
+- `MAX_FEED_ITEMS`: Maximum number of items to retain when feed merging is enabled (defaults to `50`).
+- `FEED_IMAGE_URL`: Optional public image URL for `<channel><image>`.
+- `FEED_SELF_URL`: Optional canonical feed URL for `<atom:link rel="self">`.
 
 ### Configuration Example
 
@@ -95,6 +99,8 @@ uv run main.py -g your_gist_id_here
 - `-o, --output OUTPUT`: Path to save the generated RSS xml.
 - `-g, --gist GIST`: GitHub Gist ID to update.
 - `--no-dedup`: Disable deduplication against previous results.
+- `--merge`: Merge newly generated items with previous feed items.
+- `--max-items MAX_ITEMS`: Maximum number of items to retain when `--merge` is enabled (defaults to `50`).
 
 ### GitHub Actions (Automation)
 

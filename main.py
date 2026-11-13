@@ -46,17 +46,33 @@ _REQUEST_TIMEOUT = 30
 _DEFAULT_SEARCH_MODEL = "gemini-2.5-flash"
 _DEFAULT_GEN_MODEL = "gemini-3.8-flash"
 
-# RSS media and atom namespace URIs
+# RSS media, atom, content, and Dublin Core namespace URIs
 _MEDIA_NS = "http://search.yahoo.com/mrss/"
 _ATOM_NS = "http://www.w3.org/2005/Atom"
-ET.register_namespace("media", _MEDIA_NS)
-ET.register_namespace("atom", _ATOM_NS)
+_CONTENT_NS = "http://purl.org/rss/1.0/modules/content/"
+_DC_NS = "http://purl.org/dc/elements/1.1/"
 
-# Regex to extract og:image from HTML — handles both attribute orderings
+_XML_NAMESPACES: dict[str, str] = {
+    "media": _MEDIA_NS,
+    "atom": _ATOM_NS,
+    "content": _CONTENT_NS,
+    "dc": _DC_NS,
+}
+for _prefix, _uri in _XML_NAMESPACES.items():
+    ET.register_namespace(_prefix, _uri)
+
+# Regexes to extract og:image (primary) and twitter:image (fallback) from HTML
 _OG_IMAGE_RE = re.compile(
     r"<meta[^>]+?(?:"
     r"property=[\"']og:image[\"'][^>]+?content=[\"']([^\"']+)[\"']"
     r"|content=[\"']([^\"']+)[\"'][^>]+?property=[\"']og:image[\"']"
+    r")",
+    re.IGNORECASE | re.DOTALL,
+)
+_TWITTER_IMAGE_RE = re.compile(
+    r"<meta[^>]+?(?:"
+    r"(?:name|property)=[\"']twitter:image[\"'][^>]+?content=[\"']([^\"']+)[\"']"
+    r"|content=[\"']([^\"']+)[\"'][^>]+?(?:name|property)=[\"']twitter:image[\"']"
     r")",
     re.IGNORECASE | re.DOTALL,
 )
@@ -533,14 +549,195 @@ def extract_og_image(url: str, session: requests.Session) -> str | None:
                     break
         text = b"".join(byte_chunks).decode(resp.encoding or "utf-8", errors="replace")
 
-        match = _OG_IMAGE_RE.search(text)
-        if match:
-            og_url = match.group(1) or match.group(2)
-            if og_url and is_safe_url(og_url):
-                return og_url
+        for pattern in (_OG_IMAGE_RE, _TWITTER_IMAGE_RE):
+            match = pattern.search(text)
+            if match:
+                img_url = match.group(1) or match.group(2)
+                if img_url and is_safe_url(img_url):
+                    return img_url
     except Exception:
         pass
     return None
+
+
+def ensure_xml_namespaces(xml_content: str) -> str:
+    """Ensures used XML namespace prefixes are declared on the root <rss> element.
+
+    Args:
+        xml_content (str): The RSS XML string.
+
+    Returns:
+        str: XML string with missing xmlns declarations added to <rss>.
+    """
+    missing_attrs: list[str] = []
+    for prefix, uri in _XML_NAMESPACES.items():
+        if f"<{prefix}:" in xml_content and f"xmlns:{prefix}=" not in xml_content:
+            missing_attrs.append(f'xmlns:{prefix}="{uri}"')
+
+    if not missing_attrs:
+        return xml_content
+
+    attrs_str = " ".join(missing_attrs)
+    return re.sub(
+        r"<rss(\s+|>)",
+        rf"<rss {attrs_str}\1",
+        xml_content,
+        count=1,
+    )
+
+
+def _sanitize_xml_ampersands(content: str) -> str:
+    """Escapes stray unescaped ampersands outside CDATA sections.
+
+    Args:
+        content (str): Raw XML string potentially containing CDATA blocks.
+
+    Returns:
+        str: XML string with stray ampersands escaped outside CDATA.
+    """
+    parts = re.split(r"(<!\[CDATA\[.*?\]\]>)", content, flags=re.DOTALL)
+    for i in range(0, len(parts), 2):
+        parts[i] = re.sub(
+            r"&(?!amp;|lt;|gt;|quot;|apos;|#\d+;|#x[0-9a-fA-F]+;)",
+            "&amp;",
+            parts[i],
+        )
+    return "".join(parts)
+
+
+def inject_channel_metadata(
+    xml_content: str,
+    feed_image_url: str | None = None,
+    feed_self_url: str | None = None,
+) -> str:
+    """Injects optional channel-level metadata (<image> and <atom:link rel="self">).
+
+    Args:
+        xml_content (str): Valid RSS 2.0 XML string.
+        feed_image_url (str | None): Optional public URL for the feed icon.
+        feed_self_url (str | None): Optional canonical self URL for the feed.
+
+    Returns:
+        str: Updated RSS 2.0 XML string.
+    """
+    if not feed_image_url and not feed_self_url:
+        return xml_content
+
+    try:
+        root = ET.fromstring(xml_content)
+    except ET.ParseError as e:
+        logger.warning(f"Could not parse XML for channel metadata injection: {e}")
+        return xml_content
+
+    channel = root.find("channel")
+    if channel is None:
+        return xml_content
+
+    if feed_self_url and is_safe_url(feed_self_url):
+        has_self_link = any(
+            el.get("rel") == "self" for el in channel.findall(f"{{{_ATOM_NS}}}link")
+        )
+        if not has_self_link:
+            atom_link = ET.SubElement(channel, f"{{{_ATOM_NS}}}link")
+            atom_link.set("href", feed_self_url)
+            atom_link.set("rel", "self")
+            atom_link.set("type", "application/rss+xml")
+
+    if feed_image_url and is_safe_url(feed_image_url):
+        if channel.find("image") is None:
+            title_el = channel.find("title")
+            link_el = channel.find("link")
+            image_el = ET.SubElement(channel, "image")
+            url_sub = ET.SubElement(image_el, "url")
+            url_sub.text = feed_image_url
+            title_sub = ET.SubElement(image_el, "title")
+            title_sub.text = (
+                title_el.text if title_el is not None and title_el.text else "RSS Feed"
+            )
+            link_sub = ET.SubElement(image_el, "link")
+            link_sub.text = (
+                link_el.text
+                if link_el is not None and link_el.text
+                else feed_self_url or feed_image_url
+            )
+
+    serialized = ET.tostring(root, encoding="unicode")
+    serialized = ensure_xml_namespaces(serialized)
+    if not serialized.startswith("<?xml"):
+        serialized = '<?xml version="1.0" encoding="UTF-8"?>\n' + serialized
+    return serialized
+
+
+def merge_rss_items(
+    new_xml: str,
+    previous_xml: str | None,
+    max_items: int = 50,
+) -> str:
+    """Merges previous RSS <item> entries into newly generated RSS XML.
+
+    Preserves newly generated items at the top and appends non-duplicate
+    items from previous_xml up to max_items total entries.
+
+    Args:
+        new_xml (str): Newly generated valid RSS 2.0 XML string.
+        previous_xml (str | None): Previous RSS 2.0 XML string, if any.
+        max_items (int): Maximum number of <item> elements to retain.
+
+    Returns:
+        str: Merged RSS 2.0 XML string, or new_xml if merging is skipped/fails.
+    """
+    if not previous_xml or max_items <= 0:
+        return new_xml
+
+    try:
+        new_root = ET.fromstring(new_xml)
+        prev_root = ET.fromstring(previous_xml)
+    except ET.ParseError as e:
+        logger.warning(f"Could not parse XML for feed merge: {e}")
+        return new_xml
+
+    new_channel = new_root.find("channel")
+    if new_channel is None:
+        return new_xml
+
+    current_items = new_channel.findall("item")
+    if len(current_items) >= max_items:
+        return new_xml
+
+    def _item_key(item: ET.Element) -> str:
+        guid_el = item.find("guid")
+        if guid_el is not None and guid_el.text and guid_el.text.strip():
+            return guid_el.text.strip()
+        link_el = item.find("link")
+        if link_el is not None and link_el.text and link_el.text.strip():
+            return link_el.text.strip()
+        title_el = item.find("title")
+        return title_el.text.strip() if title_el is not None and title_el.text else ""
+
+    seen_keys = {k for k in (_item_key(it) for it in current_items) if k}
+    added_count = 0
+    for prev_item in prev_root.findall(".//item"):
+        if len(current_items) + added_count >= max_items:
+            break
+        key = _item_key(prev_item)
+        if key and key in seen_keys:
+            continue
+        if key:
+            seen_keys.add(key)
+        new_channel.append(prev_item)
+        added_count += 1
+
+    if added_count == 0:
+        return new_xml
+
+    serialized = ET.tostring(new_root, encoding="unicode")
+    serialized = ensure_xml_namespaces(serialized)
+    if not serialized.startswith("<?xml"):
+        serialized = '<?xml version="1.0" encoding="UTF-8"?>\n' + serialized
+    logger.info(
+        f"Merged {added_count} previous items into feed (total: {len(current_items) + added_count})."
+    )
+    return serialized
 
 
 def add_media_thumbnails(xml_content: str) -> str:
@@ -612,6 +809,8 @@ def generate_rss_content(
     gen_model: str = _DEFAULT_GEN_MODEL,
     search_model: str = _DEFAULT_SEARCH_MODEL,
     enable_thumbnails: bool = False,
+    feed_image_url: str | None = None,
+    feed_self_url: str | None = None,
 ) -> str:
     """Generates RSS content using a 4-step pipeline.
 
@@ -821,20 +1020,23 @@ def generate_rss_content(
             f"All Available Sources (ID-masked Reference):\n{master_context_str}\n\n"
             f"{dedup_instr}\n"
             "Task: Generate a valid RSS 2.0 XML feed based on the requirements and search context above.\n"
+            f'Declare xmlns:content="{_CONTENT_NS}" and xmlns:dc="{_DC_NS}" on the root <rss version="2.0"> element.\n'
             "Rules:\n"
             '1. For any item based on the Search Context, you MUST use the exact ID (e.g., REF_ID_1) in BOTH the <link> and <guid isPermaLink="true"> tags. Do NOT use real URLs for these items.\n'
             "2. Precise Source Matching: Each news story in the Search Context is annotated with its corresponding Source ID (e.g., [REF_ID_X]) and grouped under its specific Search Topic. You MUST match each news item with its EXACT corresponding Source ID from that topic. NEVER cross-assign Source IDs between different topics or unrelated articles.\n"
             "3. For items generated from your own knowledge (such as daily English vocabulary, quotes, or general knowledge items not found in the Search Context), you MUST use real, appropriate public URLs (e.g., a standard dictionary URL for vocabulary items like https://dictionary.cambridge.org/dictionary/english/<word>, or a search URL like https://www.google.com/search?q=weather+in+<city> (replacing <city> with the lowercase English name of the target city, e.g., 'tokyo') for weather). NEVER reuse or map these to any of the REF_ID_X placeholders.\n"
-            "4. Add a category prefix in brackets to each <title> (e.g., '[Weather]', '[AI]', '[News]', '[Book]', '[Quote]').\n"
-            "5. For <pubDate>, use the specific publication time if mentioned in the context. "
+            "4. Add a category prefix in brackets to each <title> (e.g., '[Weather]', '[AI]', '[News]', '[Book]', '[Quote]'), AND include a matching <category> element (e.g., <category>AI</category>) in each <item>.\n"
+            "5. Include a <dc:creator> element in each <item> indicating the source publication name (or 'Francois Feed AI' for self-generated knowledge items).\n"
+            "6. For <pubDate>, use the specific publication time if mentioned in the context. "
             "If not mentioned, assign a realistic, varied time within the last 24 hours so that items are not all identical.\n"
-            "6. If no relevant sources or NEW updates are available for a specific topic, SKIP it entirely. "
+            "7. If no relevant sources or NEW updates are available for a specific topic, SKIP it entirely. "
             "NEVER generate entries like 'no news found' or 'No new announcements or updates were confirmed'.\n"
-            "7. If a total number of items is requested (e.g., '30 items'), you MUST fulfill this by adding more items from the categories that DO have valid sources. "
+            "8. If a total number of items is requested (e.g., '30 items'), you MUST fulfill this by adding more items from the categories that DO have valid sources. "
             "Prioritize depth in active news topics over including empty/update-only entries for quiet topics.\n"
-            "8. Deduplication (Internal): If multiple search results describe the same news story within this current run, merge them or choose the best one.\n"
-            "9. Use plain text without HTML tags in all elements; escape '<' and '>' as '&lt;' and '&gt;'. Do NOT output citation brackets like [REF_ID_X] or [cite: ...] in <title> or <description>.\n"
-            "10. Return ONLY raw XML. No markdown, no explanations."
+            "9. Deduplication (Internal): If multiple search results describe the same news story within this current run, merge them or choose the best one.\n"
+            "10. Keep <title> and <description> as plain text without HTML tags; escape '<' and '>' as '&lt;' and '&gt;'. Do NOT output citation brackets like [REF_ID_X] or [cite: ...] in <title>, <description>, or <content:encoded>.\n"
+            "11. Include <content:encoded><![CDATA[...]]></content:encoded> in each <item> with clean structured HTML (<p>, <ul>, <li>, <strong>) providing a rich, readable digest for offline RSS readers like Feeder.\n"
+            "12. Return ONLY raw XML. No markdown, no explanations."
         )
 
         rss_response: GenerateContentResponse = execute_with_retry(
@@ -880,17 +1082,24 @@ def generate_rss_content(
             escaped_url = xml.sax.saxutils.escape(raw_url, entities={'"': "&quot;"})
             content = content.replace(source_id, escaped_url)
 
-        # Sanitize any stray unescaped ampersands in XML text/links to prevent ParseError
-        content = re.sub(
-            r"&(?!amp;|lt;|gt;|quot;|apos;|#\d+;|#x[0-9a-fA-F]+;)",
-            "&amp;",
-            content,
-        )
+        # Sanitize any stray unescaped ampersands outside CDATA to prevent ParseError
+        content = _sanitize_xml_ampersands(content)
 
-        # Optional: add <media:thumbnail> from og:image (CON-4)
+        # Ensure any used namespace prefixes (content:, dc:, atom:, media:) are declared
+        content = ensure_xml_namespaces(content)
+
+        # Optional: add <media:thumbnail> from og:image / twitter:image (CON-4)
         if enable_thumbnails:
             logger.info("Step 3: Fetching OG images for media:thumbnail elements...")
             content = add_media_thumbnails(content)
+
+        # Optional: inject channel-level <image> and <atom:link rel="self">
+        if feed_image_url or feed_self_url:
+            content = inject_channel_metadata(
+                content,
+                feed_image_url=feed_image_url,
+                feed_self_url=feed_self_url,
+            )
 
         # Validate well-formedness (BUG-1)
         try:
@@ -947,6 +1156,17 @@ def main() -> None:
     parser.add_argument("-o", "--output", help="Output to a file")
     parser.add_argument("-g", "--gist", help="Update a GitHub Gist with the given ID")
     parser.add_argument("--no-dedup", action="store_true", help="Disable deduplication")
+    parser.add_argument(
+        "--merge",
+        action="store_true",
+        help="Merge newly generated items with previous feed items",
+    )
+    parser.add_argument(
+        "--max-items",
+        type=int,
+        default=None,
+        help="Maximum number of items to retain when --merge is enabled (default: 50)",
+    )
     args = parser.parse_args()
 
     instruction: str | None = os.environ.get("RSS_CONFIG_PROMPT")
@@ -965,6 +1185,17 @@ def main() -> None:
     enable_thumbnails = (
         os.environ.get("ENABLE_MEDIA_THUMBNAILS", "false").lower() == "true"
     )
+    merge_enabled = (
+        args.merge or os.environ.get("ENABLE_FEED_MERGE", "false").lower() == "true"
+    )
+    max_items_raw = os.environ.get("MAX_FEED_ITEMS", "50")
+    try:
+        default_max_items = max(1, int(max_items_raw))
+    except ValueError:
+        default_max_items = 50
+    max_items = args.max_items if args.max_items is not None else default_max_items
+    feed_image_url = os.environ.get("FEED_IMAGE_URL") or None
+    feed_self_url = os.environ.get("FEED_SELF_URL") or None
 
     logger.info(f"Starting RSS generation at {datetime.now()} (TZ: {timezone_info})")
     logger.info(f"Models — search: {search_model}, generation: {gen_model}")
@@ -977,15 +1208,16 @@ def main() -> None:
         logger.warning("RSS_CONFIG_PROMPT is not set. Using default instruction.")
         instruction = "Generate a generic RSS feed update."
 
+    prev_content: str | None = None
     previous_items: list[dict[str, str]] = []
-    if not args.no_dedup:
-        logger.info("Attempting to fetch previous RSS content for deduplication...")
+    if not args.no_dedup or merge_enabled:
+        logger.info("Attempting to fetch previous RSS content...")
         prev_content = get_previous_rss_content(args.gist, args.output)
-        if prev_content:
+        if prev_content and not args.no_dedup:
             previous_items = extract_previous_items(prev_content)
             logger.info(f"Found {len(previous_items)} previous items to exclude.")
-        else:
-            logger.info("No previous RSS content found for deduplication.")
+        elif not prev_content:
+            logger.info("No previous RSS content found.")
 
     try:
         rss_content = generate_rss_content(
@@ -995,10 +1227,15 @@ def main() -> None:
             gen_model=gen_model,
             search_model=search_model,
             enable_thumbnails=enable_thumbnails,
+            feed_image_url=feed_image_url,
+            feed_self_url=feed_self_url,
         )
     except RSSGenerationError as e:
         logger.error(f"RSS generation failed: {e}")
         sys.exit(1)
+
+    if merge_enabled and prev_content:
+        rss_content = merge_rss_items(rss_content, prev_content, max_items=max_items)
 
     if args.output:
         save_to_file(rss_content, args.output)
