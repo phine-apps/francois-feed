@@ -39,6 +39,7 @@ from main import (
     main,
     merge_rss_items,
     plan_search_queries,
+    resolve_grounding_redirect_url,
 )
 
 # ---------------------------------------------------------------------------
@@ -221,6 +222,172 @@ class TestCreateHttpSession:
         assert isinstance(adapter, HTTPAdapter)
         assert isinstance(adapter.max_retries, Retry)
         assert adapter.max_retries.total == 3
+
+    def test_caps_retry_after_max_by_default(self):
+        session = create_http_session()
+        adapter = session.get_adapter("https://example.com")
+        assert isinstance(adapter, HTTPAdapter)
+        assert isinstance(adapter.max_retries, Retry)
+        assert adapter.max_retries.retry_after_max == 10
+
+    def test_can_disable_retry_after_and_customize_retries(self):
+        session = create_http_session(total_retries=1, respect_retry_after_header=False)
+        adapter = session.get_adapter("https://example.com")
+        assert isinstance(adapter, HTTPAdapter)
+        assert isinstance(adapter.max_retries, Retry)
+        assert adapter.max_retries.total == 1
+        assert adapter.max_retries.respect_retry_after_header is False
+
+
+# ---------------------------------------------------------------------------
+# resolve_grounding_redirect_url()
+# ---------------------------------------------------------------------------
+
+
+class TestResolveGroundingRedirectUrl:
+    def test_returns_non_redirect_url_unchanged(self, monkeypatch):
+        def fail_session(*args, **kwargs):
+            raise AssertionError("Should not create HTTP session for non-redirect URL")
+
+        monkeypatch.setattr("main.create_http_session", fail_session)
+        url = "https://example.com/article"
+        assert resolve_grounding_redirect_url(url) == url
+
+    def test_resolves_head_redirect_without_following_target_site(self, monkeypatch):
+        calls: list[tuple[str, str, bool]] = []
+        closed_flags: list[str] = []
+
+        class MockResp:
+            status_code = 302
+            headers = {"Location": "https://www.reuters.com/world/story"}
+
+            def close(self):
+                closed_flags.append("resp")
+
+        class MockSession:
+            def head(self, url, allow_redirects=False, timeout=5):
+                calls.append(("HEAD", url, allow_redirects))
+                return MockResp()
+
+            def get(self, *args, **kwargs):
+                raise AssertionError("GET fallback should not run when HEAD redirects")
+
+            def close(self):
+                closed_flags.append("session")
+
+        monkeypatch.setattr("main.create_http_session", lambda **kwargs: MockSession())
+
+        src = "https://vertexaisearch.cloud.google.com/grounding-api-redirect/ABC"
+        resolved = resolve_grounding_redirect_url(src)
+        assert resolved == "https://www.reuters.com/world/story"
+        assert calls == [("HEAD", src, False)]
+        assert closed_flags == ["resp", "session"]
+
+    def test_falls_back_to_get_when_head_does_not_redirect(self, monkeypatch):
+        calls: list[tuple[str, str, bool]] = []
+
+        class HeadResp:
+            status_code = 405
+            headers: dict[str, str] = {}
+
+            def close(self):
+                pass
+
+        class GetResp:
+            status_code = 302
+            headers = {"Location": "https://example.com/final-article"}
+
+            def close(self):
+                pass
+
+        class MockSession:
+            def head(self, url, allow_redirects=False, timeout=5):
+                calls.append(("HEAD", url, allow_redirects))
+                return HeadResp()
+
+            def get(self, url, allow_redirects=False, timeout=5, stream=True):
+                calls.append(("GET", url, allow_redirects))
+                return GetResp()
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr("main.create_http_session", lambda **kwargs: MockSession())
+
+        src = "https://vertexaisearch.cloud.google.com/grounding-api-redirect/XYZ"
+        assert (
+            resolve_grounding_redirect_url(src) == "https://example.com/final-article"
+        )
+        assert calls == [("HEAD", src, False), ("GET", src, False)]
+
+    def test_follows_chained_grounding_redirects_and_stops_at_external(
+        self, monkeypatch
+    ):
+        hop1 = "https://vertexaisearch.cloud.google.com/grounding-api-redirect/HOP1"
+        hop2 = "https://vertexaisearch.cloud.google.com/grounding-api-redirect/HOP2"
+        final = "https://example.org/news/1"
+        visited: list[str] = []
+
+        class MockResp:
+            def __init__(self, location: str):
+                self.status_code = 302
+                self.headers = {"Location": location}
+
+            def close(self):
+                pass
+
+        class MockSession:
+            def head(self, url, allow_redirects=False, timeout=5):
+                visited.append(url)
+                if url == hop1:
+                    return MockResp(hop2)
+                if url == hop2:
+                    return MockResp(final)
+                raise AssertionError(f"Unexpected request to external target: {url}")
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr("main.create_http_session", lambda **kwargs: MockSession())
+
+        assert resolve_grounding_redirect_url(hop1) == final
+        assert visited == [hop1, hop2]
+
+    def test_rejects_unsafe_redirect_target(self, monkeypatch):
+        class MockResp:
+            status_code = 302
+            headers = {"Location": "http://127.0.0.1:8080/internal"}
+
+            def close(self):
+                pass
+
+        class MockSession:
+            def head(self, url, allow_redirects=False, timeout=5):
+                return MockResp()
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr("main.create_http_session", lambda **kwargs: MockSession())
+
+        src = "https://vertexaisearch.cloud.google.com/grounding-api-redirect/SSRF"
+        assert resolve_grounding_redirect_url(src) == src
+
+    def test_returns_original_url_on_request_exception(self, monkeypatch):
+        closed_flags: list[str] = []
+
+        class MockSession:
+            def head(self, url, allow_redirects=False, timeout=5):
+                raise requests.exceptions.Timeout("timed out")
+
+            def close(self):
+                closed_flags.append("session")
+
+        monkeypatch.setattr("main.create_http_session", lambda **kwargs: MockSession())
+
+        src = "https://vertexaisearch.cloud.google.com/grounding-api-redirect/ERR"
+        assert resolve_grounding_redirect_url(src) == src
+        assert closed_flags == ["session"]
 
 
 # ---------------------------------------------------------------------------
