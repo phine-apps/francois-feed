@@ -43,7 +43,7 @@ _REQUEST_TIMEOUT = 30
 # GEMINI_SEARCH_MODEL: used for query planning (Step 0) and web search (Step 1).
 # GEMINI_GEN_MODEL:    used for RSS XML generation (Step 2).
 # GEMINI_MODEL:        legacy single-model override; used as fallback for both above.
-_DEFAULT_SEARCH_MODEL = "gemini-2.5-flash"
+_DEFAULT_SEARCH_MODEL = "gemini-3.5-flash-lite"
 _DEFAULT_GEN_MODEL = "gemini-3.8-flash"
 
 # RSS media, atom, content, and Dublin Core namespace URIs

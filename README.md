@@ -4,7 +4,7 @@ A lightweight RSS feed generator powered by Gemini API. It generates an RSS 2.0 
 
 ## Features
 
-- **AI-Powered**: Uses Gemini 3.8 Flash (with Gemini 2.5 Flash for search grounding) to generate relevant and structured RSS content.
+- **AI-Powered**: Uses Gemini 3.8 Flash (with Gemini 3.5 Flash-Lite for search grounding) to generate relevant and structured RSS content.
 - **Flexible Output**: Supports stdout, local file output, and GitHub Gist updates.
 - **Fast & Modern**: Built with Python and managed by `uv` for high performance and reproducible environments.
 - **CI/CD Ready**: Integrated with GitHub Actions for daily automated updates.
@@ -19,7 +19,7 @@ A lightweight RSS feed generator powered by Gemini API. It generates an RSS 2.0 
 - GitHub Token (Personal Access Token with `gist` scope)
 
 > [!NOTE]
-> This project runs comfortably within the **Gemini API Free Tier**. For detailed pricing and quota information, please refer to the [Gemini API Pricing](https://ai.google.dev/pricing) page.
+> Grounding with Google Search on Gemini 3.x models requires the **Gemini API Paid Tier** (billing enabled). On the Paid Tier, search grounding includes 5,000 free search requests per month, and token usage for typical daily runs remains minimal. For detailed pricing and quota information, please refer to the [Gemini API Pricing](https://ai.google.dev/pricing) page.
 
 ### Installation
 
@@ -49,7 +49,7 @@ Set the following environment variables in your `.env`:
 
 #### Optional
 - `GIST_ID`: GitHub Gist ID to update (can also be passed via `-g`).
-- `GEMINI_SEARCH_MODEL`: Gemini model for query planning and web search (defaults to `gemini-2.5-flash`).
+- `GEMINI_SEARCH_MODEL`: Gemini model for query planning and web search (defaults to `gemini-3.5-flash-lite`).
 - `GEMINI_GEN_MODEL`: Gemini model for RSS XML generation (defaults to `gemini-3.8-flash`).
 - `GEMINI_MODEL`: Legacy single-model override fallback for both search and generation.
 - `TZ`: Timezone used for date calculations and logging (defaults to OS system timezone, e.g., `Asia/Tokyo`).
@@ -122,7 +122,7 @@ The following should be configured as **GitHub Secrets**:
 #### Optional Variables / Secrets
 
 - `ENABLE_MEDIA_THUMBNAILS`: Set to `true` to enable thumbnail extraction in the daily workflow.
-- `GEMINI_SEARCH_MODEL`: Custom Gemini model for search grounding (e.g., `gemini-2.5-flash`).
+- `GEMINI_SEARCH_MODEL`: Custom Gemini model for search grounding (e.g., `gemini-3.5-flash-lite`).
 - `GEMINI_GEN_MODEL`: Custom Gemini model for RSS generation (e.g., `gemini-3.8-flash` or `gemini-3.1-pro`).
 
 ## Adding to RSS Readers
