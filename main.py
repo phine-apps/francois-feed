@@ -13,10 +13,10 @@ import sys
 import time
 import xml.etree.ElementTree as ET
 import xml.sax.saxutils
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait
 from datetime import datetime
 from typing import Any, Callable, TypeVar
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import requests
 from dotenv import load_dotenv
@@ -78,22 +78,37 @@ _TWITTER_IMAGE_RE = re.compile(
 )
 
 
-def create_http_session() -> requests.Session:
+def create_http_session(
+    total_retries: int = 3,
+    respect_retry_after_header: bool = True,
+    retry_after_max: int = 10,
+) -> requests.Session:
     """Creates a requests.Session with automatic retry and exponential backoff.
 
-    Retries up to 3 times on transient server errors (5xx) and rate
-    limiting (429), with a 1-second base backoff factor between attempts.
+    Retries up to ``total_retries`` times on transient server errors (5xx) and
+    rate limiting (429), with a 1-second base backoff factor between attempts.
+    Caps ``Retry-After`` sleeps to ``retry_after_max`` seconds so external rate
+    limits cannot stall a run for hours.
+
+    Args:
+        total_retries (int): Maximum number of retry attempts. Defaults to 3.
+        respect_retry_after_header (bool): Whether to honor Retry-After headers.
+            Defaults to True.
+        retry_after_max (int): Maximum seconds to sleep for Retry-After headers.
+            Defaults to 10.
 
     Returns:
         requests.Session: A configured session ready for use.
     """
     session = requests.Session()
     retry = Retry(
-        total=3,
+        total=total_retries,
         backoff_factor=1,
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=["GET", "PATCH"],
         raise_on_status=False,
+        respect_retry_after_header=respect_retry_after_header,
+        retry_after_max=retry_after_max,
     )
     adapter = HTTPAdapter(max_retries=retry)
     session.mount("https://", adapter)
@@ -570,6 +585,65 @@ def _is_response_chain_safe(resp: Any) -> bool:
     return True
 
 
+def resolve_grounding_redirect_url(url: str, max_hops: int = 5) -> str:
+    """Resolves a Gemini search grounding redirect URL without contacting the target site.
+
+    Reads the ``Location`` header using ``allow_redirects=False`` and stops as soon
+    as the URL leaves ``grounding-api-redirect`` (or fails SSRF safety checks).
+    This avoids hanging on third-party sites that tarpit, block datacenter IPs,
+    or return long ``Retry-After`` headers.
+
+    Args:
+        url (str): Candidate URL returned by Gemini Search Grounding.
+        max_hops (int): Maximum number of grounding redirect hops to follow.
+
+    Returns:
+        str: The resolved safe public URL, or the original URL if resolution fails.
+    """
+    if "grounding-api-redirect" not in url or not is_safe_url(url):
+        return url
+
+    current_url = url
+    session = create_http_session(total_retries=1, respect_retry_after_header=False)
+    try:
+        for _ in range(max_hops):
+            if "grounding-api-redirect" not in current_url:
+                break
+
+            resp: Any = None
+            try:
+                resp = session.head(current_url, allow_redirects=False, timeout=5)
+                location = resp.headers.get("Location")
+                if not (300 <= resp.status_code < 400 and location):
+                    if hasattr(resp, "close"):
+                        resp.close()
+                    resp = session.get(
+                        current_url, allow_redirects=False, timeout=5, stream=True
+                    )
+                    location = resp.headers.get("Location")
+
+                if not (300 <= resp.status_code < 400 and location):
+                    break
+
+                next_url = urljoin(current_url, location)
+                if not is_safe_url(next_url):
+                    logger.debug(
+                        f"Skipping unsafe grounding redirect target for {current_url}: {next_url}"
+                    )
+                    break
+                current_url = next_url
+            except Exception as e:
+                logger.debug(f"Failed to resolve redirect for {current_url}: {e}")
+                break
+            finally:
+                if resp is not None and hasattr(resp, "close"):
+                    resp.close()
+    finally:
+        session.close()
+
+    return current_url
+
+
 def extract_og_image(url: str, session: requests.Session) -> str | None:
     """Fetches a URL and extracts the og:image meta tag value.
 
@@ -843,7 +917,9 @@ def add_media_thumbnails(xml_content: str) -> str:
     # Fetch OG images in parallel with thread-isolated HTTP sessions
     def _fetch(pair: tuple[ET.Element, str]) -> tuple[ET.Element, str | None]:
         element, url = pair
-        thread_session = create_http_session()
+        thread_session = create_http_session(
+            total_retries=0, respect_retry_after_header=False
+        )
         try:
             return element, extract_og_image(url, thread_session)
         finally:
@@ -979,34 +1055,33 @@ def generate_rss_content(
 
         # Resolve redirect URLs in parallel to obtain clean, direct links in the RSS feed
         logger.info("Resolving search grounding redirect URLs...")
-        resolved_pairs: list[tuple[str, str]] = []
 
         def _resolve(pair: tuple[str, str]) -> tuple[str, str]:
             url, title = pair
-            if "grounding-api-redirect" in url:
-                thread_session = create_http_session()
-                r: Any = None
-                try:
-                    r = thread_session.head(url, allow_redirects=True, timeout=5)
-                    if r.status_code < 400 and _is_response_chain_safe(r):
-                        return r.url, title
-                    if hasattr(r, "close"):
-                        r.close()
-                    r = thread_session.get(
-                        url, allow_redirects=True, timeout=5, stream=True
-                    )
-                    if _is_response_chain_safe(r):
-                        return r.url, title
-                except Exception as e:
-                    logger.debug(f"Failed to resolve redirect for {url}: {e}")
-                finally:
-                    if r is not None and hasattr(r, "close"):
-                        r.close()
-                    thread_session.close()
-            return url, title
+            return resolve_grounding_redirect_url(url), title
 
-        with ThreadPoolExecutor(max_workers=10) as executor:
-            resolved_pairs = list(executor.map(_resolve, unique_pairs))
+        resolved_pairs: list[tuple[str, str]] = list(unique_pairs)
+        executor = ThreadPoolExecutor(max_workers=10)
+        try:
+            future_to_idx = {
+                executor.submit(_resolve, pair): idx
+                for idx, pair in enumerate(unique_pairs)
+            }
+            done, not_done = wait(future_to_idx.keys(), timeout=30)
+            for future in done:
+                idx = future_to_idx[future]
+                try:
+                    resolved_pairs[idx] = future.result()
+                except Exception as e:
+                    logger.debug(
+                        f"Redirect resolution task failed for {unique_pairs[idx][0]}: {e}"
+                    )
+            if not_done:
+                logger.warning(
+                    f"Timed out waiting for {len(not_done)} redirect URL(s); using original URLs."
+                )
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
 
         # Assign global REF_IDs to deduplicated sources
         url_map: dict[str, str] = {}
